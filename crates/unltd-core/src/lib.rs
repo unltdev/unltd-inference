@@ -33,6 +33,61 @@ pub enum LoadError {
     /// El plan de memoria no cabe. `need` y `have` siempre se imprimen juntos.
     #[error("this run needs {need}, the machine has {have} available")]
     DoesNotFit { need: String, have: String },
+
+    // ---- Errores de formato de pesos (GGUF / safetensors) ----
+    // Un archivo corrupto/truncado NUNCA se degrada a "leer con ceros": eso produce
+    // un modelo que corre, fluido y equivocado (lección k3_st.c, docs/AUDIT.md §3.2).
+
+    /// Archivo corrupto con contexto (offsets y tamaños incluidos en el mensaje).
+    #[error("corrupt file: {0}")]
+    BadFile(String),
+
+    /// Los primeros 4 bytes no son "GGUF".
+    #[error("not a GGUF file: bad magic {magic:02X?} (expected 'GGUF')")]
+    BadMagic { magic: [u8; 4] },
+
+    /// Versión de GGUF fuera de {2, 3}.
+    #[error("unsupported GGUF version {0} (supported: 2 and 3)")]
+    UnsupportedVersion(u32),
+
+    /// Un tensor declara bytes más allá del final del archivo.
+    #[error("tensor '{name}' claims bytes [{offset}, {offset}+{nbytes}) beyond file size {file_size}")]
+    TensorOutOfBounds { name: String, offset: u64, nbytes: u64, file_size: u64 },
+
+    /// Dos rangos de tensores se pisan: un archivo así no puede ser leído con
+    /// confianza (el segundo tensor contendría bytes del primero).
+    #[error("tensor data overlap: '{a}' ends at {a_end}, '{b}' starts at {b_start}")]
+    TensorOverlap { a: String, b: String, a_end: u64, b_start: u64 },
+
+    /// Offset de tensor no alineado a 32 (viola la spec GGUF).
+    #[error("tensor '{name}' at offset {offset} is not aligned to {align} bytes")]
+    MisalignedTensor { name: String, offset: u64, align: u64 },
+
+    /// Id de tipo ggml fuera de la tabla conocida. Se reporta como error solo si
+    /// el llamador necesita el tamaño; el reader lo tolera con `n_bytes: None`.
+    #[error("unknown ggml type id {0}")]
+    UnknownGgmlType(u32),
+
+    /// Error de I/O del sistema.
+    #[error("i/o error: {0}")]
+    Io(#[source] std::io::Error),
+}
+
+impl LoadError {
+    /// Archivo corrupto con contexto. Preferido a un panic: es una negativa, no un accidente.
+    pub fn corrupt(msg: impl Into<String>) -> Self {
+        Self::BadFile(msg.into())
+    }
+
+    pub fn io(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<std::io::Error> for LoadError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 /// Tamaños legibles por humanos (estilo K3: "8.24 GB", "1.45 TB").
