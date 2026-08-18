@@ -41,7 +41,13 @@ pub struct GreedyLoop<F> {
 impl<F: FnMut(u32, &mut Vec<f32>) -> Result<(), LoadError>> GreedyLoop<F> {
     /// `forward` procesa un token y deja sus logits en el segundo argumento.
     pub fn new(forward: F, eos: Option<u32>, max_tokens: u32) -> Self {
-        Self { forward, eos, remaining: max_tokens, logits: Vec::new(), stopped_by_eos: false }
+        Self {
+            forward,
+            eos,
+            remaining: max_tokens,
+            logits: Vec::new(),
+            stopped_by_eos: false,
+        }
     }
 
     /// Prefill: alimenta el prompt token a token (el KV cache incremental del
@@ -91,7 +97,9 @@ mod tests {
     /// Modelo sintético: vocab = 5, el token siguiente es `(t + 1) % 5`.
     /// `seen` registra el orden exacto de tokens que recibe el forward
     /// (prefill + generación) — es el test del contrato de orden.
-    fn next_mod5(seen: &mut Vec<u32>) -> impl FnMut(u32, &mut Vec<f32>) -> Result<(), LoadError> + '_ {
+    fn next_mod5(
+        seen: &mut Vec<u32>,
+    ) -> impl FnMut(u32, &mut Vec<f32>) -> Result<(), LoadError> + '_ {
         move |t, out| {
             seen.push(t);
             let next = (t + 1) % 5;

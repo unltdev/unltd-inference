@@ -36,7 +36,7 @@ use unltd_architectures::qwen35::Qwen35Config;
 use unltd_core::LoadError;
 use unltd_model_loader::{GgufReader, MappedWeights, WeightIndex};
 use unltd_tensor::{
-    dot_f32, gdn_fused_step, gemv_quant_q8k, l2_norm_rows, rope_apply_imrope, rmsnorm, sigmoid,
+    dot_f32, gdn_fused_step, gemv_quant_q8k, l2_norm_rows, rmsnorm, rope_apply_imrope, sigmoid,
     silu, softmax, softplus, ssm_conv, swiglu, DType,
 };
 
@@ -107,12 +107,16 @@ pub struct NodeCapture {
 /// Valida un tensor del índice: presencia, element count EXACTO y dtype en la
 /// lista permitida. Devuelve el dtype real (útil para los mixtos).
 fn check(r: &GgufReader, name: &str, elems: usize, allowed: &[DType]) -> Result<DType, LoadError> {
-    let meta = r
-        .find(name)
-        .ok_or_else(|| LoadError::MissingTensor { name: name.to_string() })?;
+    let meta = r.find(name).ok_or_else(|| LoadError::MissingTensor {
+        name: name.to_string(),
+    })?;
     let got = meta.n_elements as usize;
     if got != elems {
-        return Err(LoadError::ElementCount { name: name.to_string(), got, want: elems });
+        return Err(LoadError::ElementCount {
+            name: name.to_string(),
+            got,
+            want: elems,
+        });
     }
     let dt = dtype_of(meta)?;
     if !allowed.contains(&dt) {
@@ -152,18 +156,32 @@ impl Qwen35Forward {
             let pre = format!("blk.{il}.");
             // Comunes a ambos tipos de capa.
             check(r, &format!("{pre}attn_norm.weight"), n, &[DType::F32])?;
-            check(r, &format!("{pre}post_attention_norm.weight"), n, &[DType::F32])?;
+            check(
+                r,
+                &format!("{pre}post_attention_norm.weight"),
+                n,
+                &[DType::F32],
+            )?;
             check(r, &format!("{pre}ffn_gate.weight"), n * n_ff, &[DType::Q4K])?;
             check(r, &format!("{pre}ffn_up.weight"), n * n_ff, &[DType::Q4K])?;
-            ffn_down_dtype[il] =
-                check(r, &format!("{pre}ffn_down.weight"), n_ff * n, &[DType::Q4K, DType::Q6K])?;
+            ffn_down_dtype[il] = check(
+                r,
+                &format!("{pre}ffn_down.weight"),
+                n_ff * n,
+                &[DType::Q4K, DType::Q6K],
+            )?;
 
             if cfg.is_full_attn(il) {
                 attn_slot[il] = n_attn;
                 n_attn += 1;
                 check(r, &format!("{pre}attn_q.weight"), n * 2 * n, &[DType::Q4K])?;
                 check(r, &format!("{pre}attn_q_norm.weight"), hdv, &[DType::F32])?;
-                check(r, &format!("{pre}attn_k.weight"), n * nhkv * hdv, &[DType::Q4K])?;
+                check(
+                    r,
+                    &format!("{pre}attn_k.weight"),
+                    n * nhkv * hdv,
+                    &[DType::Q4K],
+                )?;
                 check(r, &format!("{pre}attn_k_norm.weight"), hdv, &[DType::F32])?;
                 attn_v_dtype[il] = check(
                     r,
@@ -197,7 +215,15 @@ impl Qwen35Forward {
             }
         }
 
-        Ok(Self { cfg, head, recr_slot, attn_slot, attn_v_dtype, ffn_down_dtype, qkv_dtype })
+        Ok(Self {
+            cfg,
+            head,
+            recr_slot,
+            attn_slot,
+            attn_v_dtype,
+            ffn_down_dtype,
+            qkv_dtype,
+        })
     }
 
     /// Sesión con todo el estado recurrente a cero y cache K/V pre-dimensionado.
@@ -218,7 +244,14 @@ impl Qwen35Forward {
                 gdn.push(vec![0.0f32; n_v * hd * hd]);
             }
         }
-        Qwen35Session { conv, gdn, k_cache, v_cache, position: 0, ctx }
+        Qwen35Session {
+            conv,
+            gdn,
+            k_cache,
+            v_cache,
+            position: 0,
+            ctx,
+        }
     }
 
     pub fn vocab(&self) -> usize {
@@ -281,7 +314,9 @@ impl Qwen35Forward {
                     s,
                     il,
                     &x,
-                    nodes.as_mut().map(|c| c.per_token.last_mut().expect("token pushed")),
+                    nodes
+                        .as_mut()
+                        .map(|c| c.per_token.last_mut().expect("token pushed")),
                 )?;
                 (r.l_out, r.residual, r.linear_out)
             };
@@ -318,7 +353,8 @@ impl Qwen35Forward {
         let mut x = vec![0.0f32; n];
         {
             let wn: &[f32] = bytemuck::cast_slice(
-                w.tensor_checked(&format!("{pre}attn_norm.weight"), n).expect("validado en open"),
+                w.tensor_checked(&format!("{pre}attn_norm.weight"), n)
+                    .expect("validado en open"),
             );
             rmsnorm(&mut x, x_in, wn, eps);
         }
@@ -326,17 +362,45 @@ impl Qwen35Forward {
 
         // 2) qkv [8192] y z [4096]
         let mut qkv = vec![0.0f32; d_conv];
-        gemv_quant_q8k(&mut qkv, &x, wq(&w, &pre, "attn_qkv.weight"), n, d_conv, self.qkv_dtype[il]);
+        gemv_quant_q8k(
+            &mut qkv,
+            &x,
+            wq(&w, &pre, "attn_qkv.weight"),
+            n,
+            d_conv,
+            self.qkv_dtype[il],
+        );
         let mut z = vec![0.0f32; n];
-        gemv_quant_q8k(&mut z, &x, wq(&w, &pre, "attn_gate.weight"), n, n, DType::Q4K);
+        gemv_quant_q8k(
+            &mut z,
+            &x,
+            wq(&w, &pre, "attn_gate.weight"),
+            n,
+            n,
+            DType::Q4K,
+        );
         push_node(&mut nodes, il, "linear_attn_qkv_mixed", qkv.clone());
         push_node(&mut nodes, il, "z", z.clone());
 
         // 3) beta = sigmoid(ssm_beta·x); gate = softplus(ssm_alpha·x + dt_bias)·ssm_a
         let mut beta_raw = vec![0.0f32; n_v];
-        gemv_quant_q8k(&mut beta_raw, &x, wq(&w, &pre, "ssm_beta.weight"), n, n_v, DType::Q4K);
+        gemv_quant_q8k(
+            &mut beta_raw,
+            &x,
+            wq(&w, &pre, "ssm_beta.weight"),
+            n,
+            n_v,
+            DType::Q4K,
+        );
         let mut alpha = vec![0.0f32; n_v];
-        gemv_quant_q8k(&mut alpha, &x, wq(&w, &pre, "ssm_alpha.weight"), n, n_v, DType::Q4K);
+        gemv_quant_q8k(
+            &mut alpha,
+            &x,
+            wq(&w, &pre, "ssm_alpha.weight"),
+            n,
+            n_v,
+            DType::Q4K,
+        );
         let mut beta = vec![0.0f32; n_v];
         sigmoid(&mut beta, &beta_raw);
         let mut biased = vec![0.0f32; n_v];
@@ -344,7 +408,8 @@ impl Qwen35Forward {
         {
             let dt_b: &[f32] =
                 bytemuck::cast_slice(w.tensor_checked(&format!("{pre}ssm_dt.bias"), n_v).unwrap());
-            let a: &[f32] = bytemuck::cast_slice(w.tensor_checked(&format!("{pre}ssm_a"), n_v).unwrap());
+            let a: &[f32] =
+                bytemuck::cast_slice(w.tensor_checked(&format!("{pre}ssm_a"), n_v).unwrap());
             for h in 0..n_v {
                 biased[h] = alpha[h] + dt_b[h];
             }
@@ -429,7 +494,8 @@ impl Qwen35Forward {
         let mut y = vec![0.0f32; n];
         {
             let wn: &[f32] = bytemuck::cast_slice(
-                w.tensor_checked(&format!("{pre}ssm_norm.weight"), hd).unwrap(),
+                w.tensor_checked(&format!("{pre}ssm_norm.weight"), hd)
+                    .unwrap(),
             );
             for h in 0..n_v {
                 let (a0, a1) = (h * hd, (h + 1) * hd);
@@ -447,7 +513,14 @@ impl Qwen35Forward {
 
         // 7) proyección de salida + residual
         let mut attn_out = vec![0.0f32; n];
-        gemv_quant_q8k(&mut attn_out, &y, wq(&w, &pre, "ssm_out.weight"), n, n, DType::Q4K);
+        gemv_quant_q8k(
+            &mut attn_out,
+            &y,
+            wq(&w, &pre, "ssm_out.weight"),
+            n,
+            n,
+            DType::Q4K,
+        );
         let mut residual = vec![0.0f32; n];
         for i in 0..n {
             residual[i] = x_in[i] + attn_out[i];
@@ -462,7 +535,11 @@ impl Qwen35Forward {
             l_out[i] = residual[i] + f[i];
         }
         push_node(&mut nodes, il, "l_out", l_out.clone());
-        Ok(RecrOut { l_out, residual, linear_out: attn_out })
+        Ok(RecrOut {
+            l_out,
+            residual,
+            linear_out: attn_out,
+        })
     }
 
     /// Capa de atención completa, algoritmo de docs/QWEN35-FORWARD.md §4.
@@ -487,19 +564,28 @@ impl Qwen35Forward {
         let mut x = vec![0.0f32; n];
         {
             let wn: &[f32] = bytemuck::cast_slice(
-                w.tensor_checked(&format!("{pre}attn_norm.weight"), n).expect("validado en open"),
+                w.tensor_checked(&format!("{pre}attn_norm.weight"), n)
+                    .expect("validado en open"),
             );
             rmsnorm(&mut x, x_in, wn, eps);
         }
 
         // 2) Qfull [8192]: por head h, q en [512h..512h+256), gate en [512h+256..512h+512)
         let mut qfull = vec![0.0f32; 2 * n];
-        gemv_quant_q8k(&mut qfull, &x, wq(&w, &pre, "attn_q.weight"), n, 2 * n, DType::Q4K);
+        gemv_quant_q8k(
+            &mut qfull,
+            &x,
+            wq(&w, &pre, "attn_q.weight"),
+            n,
+            2 * n,
+            DType::Q4K,
+        );
         let mut q = vec![0.0f32; n];
         let mut gate = vec![0.0f32; n];
         {
             let qnw: &[f32] = bytemuck::cast_slice(
-                w.tensor_checked(&format!("{pre}attn_q_norm.weight"), hdv).unwrap(),
+                w.tensor_checked(&format!("{pre}attn_q_norm.weight"), hdv)
+                    .unwrap(),
             );
             for h in 0..nh {
                 let (a0, a1) = (h * hdv, (h + 1) * hdv);
@@ -514,11 +600,19 @@ impl Qwen35Forward {
 
         // 3) K [1024] con norma por kv-head; V [1024] sin norma
         let mut k = vec![0.0f32; nhkv * hdv];
-        gemv_quant_q8k(&mut k, &x, wq(&w, &pre, "attn_k.weight"), n, nhkv * hdv, DType::Q4K);
+        gemv_quant_q8k(
+            &mut k,
+            &x,
+            wq(&w, &pre, "attn_k.weight"),
+            n,
+            nhkv * hdv,
+            DType::Q4K,
+        );
         let mut kn = vec![0.0f32; nhkv * hdv];
         {
             let knw: &[f32] = bytemuck::cast_slice(
-                w.tensor_checked(&format!("{pre}attn_k_norm.weight"), hdv).unwrap(),
+                w.tensor_checked(&format!("{pre}attn_k_norm.weight"), hdv)
+                    .unwrap(),
             );
             for hkv in 0..nhkv {
                 let (a0, a1) = (hkv * hdv, (hkv + 1) * hdv);
@@ -568,8 +662,8 @@ impl Qwen35Forward {
                 for i in 0..hdv {
                     let mut sum = 0.0f64;
                     for p in 0..n_ctx {
-                        sum += (soft[p] as f64)
-                            * (s.v_cache[slot][p * kv_len + kv * hdv + i] as f64);
+                        sum +=
+                            (soft[p] as f64) * (s.v_cache[slot][p * kv_len + kv * hdv + i] as f64);
                     }
                     acc[i] = sum;
                 }
@@ -591,7 +685,14 @@ impl Qwen35Forward {
 
         // 7) proyección de salida + residual + FFN (idéntico a la recurrente)
         let mut attn_out = vec![0.0f32; n];
-        gemv_quant_q8k(&mut attn_out, &gated, wq(&w, &pre, "attn_output.weight"), n, n, DType::Q4K);
+        gemv_quant_q8k(
+            &mut attn_out,
+            &gated,
+            wq(&w, &pre, "attn_output.weight"),
+            n,
+            n,
+            DType::Q4K,
+        );
         let mut residual = vec![0.0f32; n];
         for i in 0..n {
             residual[i] = x_in[i] + attn_out[i];
@@ -601,7 +702,11 @@ impl Qwen35Forward {
         for i in 0..n {
             l_out[i] = residual[i] + f[i];
         }
-        Ok(RecrOut { l_out, residual, linear_out: vec![0.0f32; n] })
+        Ok(RecrOut {
+            l_out,
+            residual,
+            linear_out: vec![0.0f32; n],
+        })
     }
 
     /// post_attention_norm + FFN SwiGLU paralela: `f = ffn_down · (silu(ffn_gate·p) * ffn_up·p)`.
@@ -627,16 +732,37 @@ impl Qwen35Forward {
         }
         push_node(&mut nodes, il, "attn_post_norm", p.clone());
         let mut g = vec![0.0f32; n_ff];
-        gemv_quant_q8k(&mut g, &p, wq(w, &pre, "ffn_gate.weight"), n, n_ff, DType::Q4K);
+        gemv_quant_q8k(
+            &mut g,
+            &p,
+            wq(w, &pre, "ffn_gate.weight"),
+            n,
+            n_ff,
+            DType::Q4K,
+        );
         let mut u = vec![0.0f32; n_ff];
-        gemv_quant_q8k(&mut u, &p, wq(w, &pre, "ffn_up.weight"), n, n_ff, DType::Q4K);
+        gemv_quant_q8k(
+            &mut u,
+            &p,
+            wq(w, &pre, "ffn_up.weight"),
+            n,
+            n_ff,
+            DType::Q4K,
+        );
         let mut sw = vec![0.0f32; n_ff];
         swiglu(&mut sw, &g, &u);
         push_node(&mut nodes, il, "ffn_gate", g.clone());
         push_node(&mut nodes, il, "ffn_up", u.clone());
         push_node(&mut nodes, il, "ffn_swiglu", sw.clone());
         let mut f = vec![0.0f32; n];
-        gemv_quant_q8k(&mut f, &sw, wq(w, &pre, "ffn_down.weight"), n_ff, n, self.ffn_down_dtype[il]);
+        gemv_quant_q8k(
+            &mut f,
+            &sw,
+            wq(w, &pre, "ffn_down.weight"),
+            n_ff,
+            n,
+            self.ffn_down_dtype[il],
+        );
         push_node(&mut nodes, il, "ffn_out", f.clone());
         Ok(f)
     }
@@ -655,12 +781,7 @@ fn wq<'a>(w: &'a MappedWeights, pre: &str, name: &str) -> &'a [u8] {
 
 /// Empuja un nodo capturado con sufijo de capa (`nombre-{il}`, igual que los
 /// cbs del volcado): `compare-nodes-oracle.py` empareja por nombre exacto.
-fn push_node(
-    nodes: &mut Option<&mut Vec<(String, Vec<f32>)>>,
-    il: usize,
-    name: &str,
-    v: Vec<f32>,
-) {
+fn push_node(nodes: &mut Option<&mut Vec<(String, Vec<f32>)>>, il: usize, name: &str, v: Vec<f32>) {
     if let Some(ns) = nodes {
         ns.push((format!("{name}-{il}"), v));
     }

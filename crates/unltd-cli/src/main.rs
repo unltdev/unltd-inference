@@ -20,6 +20,7 @@ use clap::{Parser, Subcommand};
 
 use unltd_core::{human, LoadError};
 use unltd_generation::{GreedyLoop, LayerDump, MinForward, NodeCapture, Qwen35Forward};
+use unltd_memory::{parse_size, MemoryAccounting};
 use unltd_model_loader::{GgufReader, MappedWeights};
 use unltd_tokenizer::{Gpt2Tokenizer, TokenError, Tokenizer};
 
@@ -95,7 +96,9 @@ enum Cmd {
         text: String,
     },
 
-    /// Genera texto con el motor (Fase 8): greedy determinista, temperatura 0.
+    /// Genera texto con el motor (Fases 8-10): greedy determinista, temperatura
+    /// 0, con presupuesto de memoria controlada opcional (Fase 9) y ejecución
+    /// disk-first sobre mmap (Fase 10: el modelo nunca se copia a heap).
     Run {
         /// Modelo: archivo .gguf.
         model: PathBuf,
@@ -110,6 +113,14 @@ enum Cmd {
         /// Temperatura: solo 0 (greedy determinista) — sampling llega después.
         #[arg(long, default_value_t = 0.0)]
         temperature: f64,
+
+        /// Presupuesto de memoria CONTROLADA (Fase 9): 512M, 1G, 2G, 4G, 8G,
+        /// 512MB, 4GB o bytes crudos. Limita SOLO lo que el runtime mantiene
+        /// residente a propósito (KV, scratch, estados, overhead) — el modelo
+        /// vive en mmap paginado por demanda y NO cuenta contra el presupuesto
+        /// (mapped != resident). Sin la opción: sin límite (modo Fase 8).
+        #[arg(long)]
+        memory_budget: Option<String>,
     },
 }
 
@@ -122,16 +133,29 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::MinForward { model, tokens, oracle_dir, legacy_prec } => {
+        Cmd::MinForward {
+            model,
+            tokens,
+            oracle_dir,
+            legacy_prec,
+        } => {
             if let Err(e) = cmd_min_forward(&model, &tokens, oracle_dir.as_deref(), legacy_prec) {
                 eprintln!("unltd min-forward: {e}");
                 std::process::exit(1);
             }
         }
-        Cmd::ForwardOracle { model, out_dir, oracle_dir, debug_nodes } => {
-            if let Err(e) =
-                cmd_forward_oracle(&model, &out_dir, oracle_dir.as_deref(), debug_nodes.as_deref())
-            {
+        Cmd::ForwardOracle {
+            model,
+            out_dir,
+            oracle_dir,
+            debug_nodes,
+        } => {
+            if let Err(e) = cmd_forward_oracle(
+                &model,
+                &out_dir,
+                oracle_dir.as_deref(),
+                debug_nodes.as_deref(),
+            ) {
                 eprintln!("unltd forward-oracle: {e}");
                 std::process::exit(1);
             }
@@ -142,8 +166,20 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::Run { model, prompt, max_tokens, temperature } => {
-            if let Err(e) = cmd_run(&model, &prompt, max_tokens, temperature) {
+        Cmd::Run {
+            model,
+            prompt,
+            max_tokens,
+            temperature,
+            memory_budget,
+        } => {
+            if let Err(e) = cmd_run(
+                &model,
+                &prompt,
+                max_tokens,
+                temperature,
+                memory_budget.as_deref(),
+            ) {
                 eprintln!("unltd run: {e}");
                 std::process::exit(1);
             }
@@ -256,9 +292,9 @@ fn cmd_tokenize(model: &Path, text: &str) -> Result<(), LoadError> {
 
     let mut ids = Vec::new();
     tok.encode(text, &mut ids).map_err(|e| match e {
-        TokenError::PieceMissing(p) => {
-            LoadError::corrupt(format!("encode: pieza {p:?} fuera del vocab (fallback por char incluido)"))
-        }
+        TokenError::PieceMissing(p) => LoadError::corrupt(format!(
+            "encode: pieza {p:?} fuera del vocab (fallback por char incluido)"
+        )),
         other => LoadError::corrupt(format!("encode: {other}")),
     })?;
 
@@ -267,11 +303,13 @@ fn cmd_tokenize(model: &Path, text: &str) -> Result<(), LoadError> {
     for (i, &id) in ids.iter().enumerate() {
         let piece = tok.piece(id).unwrap_or("<fuera de rango>");
         let mut dec = Vec::new();
-        tok.decode(&[id], &mut dec).map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
+        tok.decode(&[id], &mut dec)
+            .map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
         println!("  [{i:>3}] id {id:<7} piece {piece:?} decoded {dec:?}");
     }
     let mut decoded = Vec::new();
-    tok.decode(&ids, &mut decoded).map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
+    tok.decode(&ids, &mut decoded)
+        .map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
     println!();
     println!("ids     : {ids:?}");
     println!("decoded : {:?}", String::from_utf8_lossy(&decoded));
@@ -299,7 +337,13 @@ const ORACLE_GENERATED_TOKENS: [u32; 20] = [
 /// `step | UNLTD | oracle | match`). Si divergen, se reporta el PRIMER token
 /// distinto y se sigue generando para completar la tabla (política de la
 /// directiva: aislar el primer mismatch, no detenerse a investigar acá).
-fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Result<(), LoadError> {
+fn cmd_run(
+    model: &Path,
+    prompt: &str,
+    max_tokens: u32,
+    temperature: f64,
+    memory_budget: Option<&str>,
+) -> Result<(), LoadError> {
     if temperature != 0.0 || temperature.is_nan() {
         return Err(LoadError::corrupt(format!(
             "temperatura {temperature}: solo 0 (greedy determinista) está implementado (Fase 8)"
@@ -314,9 +358,9 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
     // add_bos). ornith no declara bos_token_id, así que no hay política de BOS.
     let mut prompt_ids = Vec::new();
     tok.encode(prompt, &mut prompt_ids).map_err(|e| match e {
-        TokenError::PieceMissing(p) => {
-            LoadError::corrupt(format!("encode: pieza {p:?} fuera del vocab (fallback por char incluido)"))
-        }
+        TokenError::PieceMissing(p) => LoadError::corrupt(format!(
+            "encode: pieza {p:?} fuera del vocab (fallback por char incluido)"
+        )),
         other => LoadError::corrupt(format!("encode: {other}")),
     })?;
     if prompt_ids.is_empty() {
@@ -324,6 +368,88 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
     }
 
     let ctx = prompt_ids.len() + max_tokens as usize;
+
+    // ---- Fase 9: presupuesto de memoria controlada. El plan se suma ENTERO
+    // ANTES de asignar nada (contrato: negarse con números, nunca OOM-kill).
+    let mut kv_bytes = 0u64;
+    for il in 0..fwd.cfg.n_layer {
+        if fwd.cfg.is_full_attn(il) {
+            kv_bytes += (ctx * fwd.cfg.n_head_kv * fwd.cfg.head_dim_v * 2 * 4) as u64;
+        }
+    }
+    let (recurrent_bytes, scratch_bytes, runtime_bytes) = controlled_plan(&fwd, &tok, &reader, ctx);
+    // El estado recurrente (conv ring + GDN) es memoria CONTROLADA residente
+    // deliberadamente (la asigna `new_session`), igual que el tokenizer: se
+    // contabiliza en runtime_bytes. mandatory = KV + scratch + runtime_total.
+    let runtime_total = runtime_bytes.saturating_add(recurrent_bytes);
+    let mandatory_bytes = kv_bytes
+        .saturating_add(scratch_bytes)
+        .saturating_add(runtime_total);
+    let budget = match memory_budget {
+        Some(s) => Some(
+            parse_size(s).map_err(|e| LoadError::corrupt(format!("--memory-budget {s:?}: {e}")))?,
+        ),
+        None => None,
+    };
+    let acc = budget.map(|b| {
+        let mut a = MemoryAccounting::new(b, mandatory_bytes);
+        a.kv_cache_bytes = kv_bytes;
+        a.scratch_bytes = scratch_bytes;
+        a.runtime_bytes = runtime_total;
+        // weight_buffer_bytes y weight_cache_bytes quedan en 0: los pesos son
+        // VISTAS sobre el mmap (Fase 10), sin copias heap ni cache de dequant.
+        a
+    });
+    if let Some(a) = &acc {
+        if a.mandatory_bytes > a.configured_budget {
+            println!("REFUSING TO RUN — el presupuesto no cubre el mínimo mandatorio:");
+            println!(
+                "  Memory budget    : {} ({:?} bytes)",
+                human(a.configured_budget),
+                a.configured_budget
+            );
+            println!(
+                "  Required minimum : {} ({:?} bytes) = weight buffers + weight cache + KV + scratch + runtime (runtime incluye estado recurrente)",
+                human(a.mandatory_bytes),
+                a.mandatory_bytes
+            );
+            println!("  KV cache         : {}", human(a.kv_cache_bytes));
+            println!("  Recurrent state  : {}", human(recurrent_bytes));
+            println!("  Scratch (peak)   : {}", human(a.scratch_bytes));
+            println!(
+                "  Runtime overhead : {} (tokenizer + índice GGUF + estado recurrente)",
+                human(a.runtime_bytes)
+            );
+            println!(
+                "  Layer buffers    : {} (pesos = vistas sobre mmap, sin copias)",
+                human(a.weight_buffer_bytes)
+            );
+            std::process::exit(2);
+        }
+    }
+
+    println!("modelo  : {}", model.display());
+    println!("arch    : qwen35 (Fases 8-10, greedy temperatura 0)");
+    println!("prompt  : {prompt:?}");
+    println!(
+        "tokens  : {prompt_ids:?} ({}, raw sin BOS)",
+        prompt_ids.len()
+    );
+    println!("eos     : {:?}", tok.eos());
+    println!("max     : {max_tokens}");
+    println!("ctx     : {ctx} (prompt + max_tokens, KV cache pre-dimensionado)");
+
+    match &acc {
+        Some(a) => print_memory_plan("plan", a, reader.file_size, recurrent_bytes),
+        // Sin presupuesto: línea informativa previa (modo Fase 8, sin cambios).
+        None => println!(
+            "ram     : {} modelo (mmap, paginado) + {} KV cache + activaciones O(n_embd={})",
+            human(reader.file_size),
+            human(kv_bytes),
+            fwd.cfg.n_embd
+        ),
+    }
+
     let mut session = fwd.new_session(ctx);
 
     let mut gen = GreedyLoop::new(
@@ -336,35 +462,6 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
         },
         tok.eos(),
         max_tokens,
-    );
-
-    println!("modelo  : {}", model.display());
-    println!("arch    : qwen35 (Fase 8, greedy temperatura 0)");
-    println!("prompt  : {prompt:?}");
-    println!(
-        "tokens  : {prompt_ids:?} ({}, raw sin BOS)",
-        prompt_ids.len()
-    );
-    println!("eos     : {:?}", tok.eos());
-    println!("max     : {max_tokens}");
-    println!(
-        "ctx     : {ctx} (prompt + max_tokens, KV cache pre-dimensionado)"
-    );
-
-    // RAM aproximada (analítica, sin API de proceso): el archivo se mapea y
-    // se pagina por demanda; el KV cache es el único término que crece con ctx.
-    let mut kv_bytes = 0u64;
-    for il in 0..fwd.cfg.n_layer {
-        if fwd.cfg.is_full_attn(il) {
-            kv_bytes +=
-                (ctx * fwd.cfg.n_head_kv * fwd.cfg.head_dim_v * 2 * 4) as u64;
-        }
-    }
-    println!(
-        "ram     : {} modelo (mmap, paginado) + {} KV cache + activaciones O(n_embd={})",
-        human(reader.file_size),
-        human(kv_bytes),
-        fwd.cfg.n_embd
     );
 
     let t0 = std::time::Instant::now();
@@ -401,7 +498,11 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
             let (ti, top) = top5(&decision_logits);
             println!("       top-5 decisión: [{ti}] {top:?}");
             if let Some(o) = oracle {
-                match decision_logits.iter().enumerate().find(|(i, _)| *i == o as usize) {
+                match decision_logits
+                    .iter()
+                    .enumerate()
+                    .find(|(i, _)| *i == o as usize)
+                {
                     Some((_, &v)) => {
                         let gap = decision_logits[ti] - v;
                         println!("       oráculo {o} en logit {v:.6} (gap al argmax {gap:.6})");
@@ -427,20 +528,24 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
     // top-5 del último token (informativo: la puerta es el argmax, los valores
     // difieren del oráculo dentro del contrato numérico de la Fase 6).
     let (top_idx, top) = top5(gen.logits());
-    println!(
-        "top-5   : [{top_idx}] {top:?} (informativo, la puerta es el argmax)"
-    );
+    println!("top-5   : [{top_idx}] {top:?} (informativo, la puerta es el argmax)");
 
     let mut decoded = Vec::new();
     tok.decode(&generated, &mut decoded)
         .map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
     println!("decoded : {:?}", String::from_utf8_lossy(&decoded));
     println!();
-    println!(
-        "matches : {n_match}/{max_tokens} contra el oráculo"
-    );
-    let n_forward = if generated.is_empty() { 0 } else { generated.len() - 1 };
-    let s_per_tok = if n_forward > 0 { t_gen.as_secs_f64() / n_forward as f64 } else { 0.0 };
+    println!("matches : {n_match}/{max_tokens} contra el oráculo");
+    let n_forward = if generated.is_empty() {
+        0
+    } else {
+        generated.len() - 1
+    };
+    let s_per_tok = if n_forward > 0 {
+        t_gen.as_secs_f64() / n_forward as f64
+    } else {
+        0.0
+    };
     println!(
         "tiempos : prefill {:.1}s (TTFT ~= prefill, el token 1 sale del último logit del prefill); \
          decode {:.1}s para {} forwards ({:.2} s/token); total {:.1}s",
@@ -450,6 +555,36 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
         s_per_tok,
         (t_prefill + t_gen).as_secs_f64(),
     );
+
+    // ---- Fase 9: reporte final con cifras MEDIDAS del proceso (RSS e IO),
+    // no del plan. El peak RSS puede superar el presupuesto sin violarlo:
+    // incluye páginas del modelo cacheadas por el SO (demand paging, Fase 10).
+    if let Some(a) = &acc {
+        println!();
+        print_memory_plan("final", a, reader.file_size, recurrent_bytes);
+        let (peak_rss, rss_now, read_bytes) = measure_process(std::process::id());
+        match (peak_rss, rss_now) {
+            (Some(peak), Some(now)) => {
+                println!(
+                    "  peak RSS (medido)   : {} (PeakWorkingSet64; incluye páginas del modelo cacheadas por el SO)",
+                    human(peak)
+                );
+                println!("  working set actual   : {}", human(now));
+            }
+            _ => println!(
+                "  peak RSS (medido)   : Unavailable (PowerShell no disponible — no se inventan números)"
+            ),
+        }
+        match read_bytes {
+            Some(b) => println!(
+                "  bytes read (proceso): {} (GetProcessIoCounters; incluye exe/DLLs, no solo el modelo)",
+                human(b)
+            ),
+            None => println!(
+                "  bytes read (proceso): Unavailable (GetProcessIoCounters no disponible)"
+            ),
+        }
+    }
 
     match first_mismatch {
         None => {
@@ -462,6 +597,174 @@ fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Res
                  UNLTD {mine} vs oráculo {oracle}"
             );
             std::process::exit(3);
+        }
+    }
+}
+
+/// Plan de la memoria controlada (Fase 9), excluido el KV (fórmula propia):
+/// estado recurrente (conv ring + GDN) y pico estimado del scratch por paso.
+/// `runtime_bytes` mide las estructuras reales (tokenizer + índice GGUF); el
+/// llamador SUMA el estado recurrente a runtime (es memoria controlada
+/// residente, asignada por `new_session`). Los pesos NO aparecen: son vistas
+/// sobre el mmap, sin materialización en heap (Fase 10) —
+/// `weight_buffer_bytes` y `weight_cache_bytes` quedan en 0.
+fn controlled_plan(
+    fwd: &Qwen35Forward,
+    tok: &Gpt2Tokenizer,
+    reader: &GgufReader,
+    ctx: usize,
+) -> (u64, u64, u64) {
+    let c = &fwd.cfg;
+    let n = c.n_embd;
+    let n_ff = c.n_ff;
+    let n_v = c.n_v_heads();
+    let hd = c.head_dim_linear();
+    let d_conv = c.d_conv();
+    let mut n_recr = 0usize;
+    for il in 0..c.n_layer {
+        if !c.is_full_attn(il) {
+            n_recr += 1;
+        }
+    }
+    // conv ring (conv_kernel-1)×d_conv + estado GDN n_v×hd×hd, por capa
+    // recurrente, en f32 (ver Qwen35Forward::new_session).
+    let recurrent = n_recr as u64 * ((c.conv_kernel - 1) * d_conv + n_v * hd * hd) as u64 * 4;
+
+    // Scratch: suma conservadora de los Vecs f32 transitorios de UN paso
+    // (step + ambas capas + FFN, ver qwen35_forward.rs) + logits del bucle
+    // greedy (loop + snapshot del CLI) + índice del sort top-5 (u64/vocab).
+    // Es el pico de activaciones; no crece con el contexto salvo scores.
+    let vocab = fwd.vocab();
+    let elems = 18 * n as u64 // out/x/z/y/l_out/residual/attn_out/gdn_out/z_silu/q/gate/qfull/f/embed
+        + 3 * n_ff as u64 // FFN gate/up/down
+        + 8 * d_conv as u64 // qkv/conv_out/mix + kernel conv_kernel·d_conv
+        + 5 * n_v as u64 // beta_raw/alpha/beta/beta_biased/sp
+        + 2 * c.n_head_kv as u64 * c.head_dim_v as u64 // k + v
+        + c.n_head as u64 * ctx as u64; // scores de attn
+    let scratch = elems * 4 + 2 * vocab as u64 * 4 + vocab as u64 * 8;
+
+    // Runtime: heap real del tokenizer + índice GGUF (strings de metadata y
+    // tabla de tensores). Estimación conservadora; el RSS es el veredicto.
+    let runtime = tok.heap_bytes().saturating_add(gguf_index_bytes(reader));
+
+    (recurrent, scratch, runtime)
+}
+
+/// Estimación conservadora del heap del índice GGUF (metadata + tabla de
+/// tensores). El reader parsea SOLO header+índice; los datos de los tensores
+/// viven en el mmap y no se copian.
+fn gguf_index_bytes(r: &GgufReader) -> u64 {
+    let mut b = 0u64;
+    for (k, v) in &r.metadata {
+        b += (k.len() as u64).saturating_add(v.describe().len() as u64);
+    }
+    for t in r.tensors() {
+        b += (t.name.len() as u64).saturating_add(96); // shape/offset/dtype ≈ 96 B
+    }
+    b
+}
+
+/// Reporte de memoria del contrato Fase 9: file size, mapped virtual, pesos
+/// controlados (buffer + cache), KV, scratch, runtime, presupuesto y los tres
+/// métodos del componente de contabilidad. `phase` = "plan" (antes de
+/// asignar) o "final" (con las cifras medidas que el llamador agrega).
+/// `recurrent_bytes` es solo display: ya está incluido en runtime_bytes.
+fn print_memory_plan(phase: &str, a: &MemoryAccounting, file_size: u64, recurrent_bytes: u64) {
+    println!("memoria ({phase}, Fase 9):");
+    println!(
+        "  file size            : {} ({} bytes)",
+        human(file_size),
+        file_size
+    );
+    println!(
+        "  mapped (virtual)     : {} (mmap del archivo completo — NO cuenta contra el presupuesto; mapped != resident)",
+        human(file_size)
+    );
+    println!(
+        "  configured budget    : {} ({} bytes, SOLO memoria controlada)",
+        human(a.configured_budget),
+        a.configured_budget
+    );
+    println!("  controlled:");
+    println!(
+        "    weight_buffer_bytes: {} (pesos = vistas sobre mmap, sin copias heap)",
+        human(a.weight_buffer_bytes)
+    );
+    println!(
+        "    weight_cache_bytes : {} (sin cache de dequant)",
+        human(a.weight_cache_bytes)
+    );
+    println!("    kv_cache_bytes     : {}", human(a.kv_cache_bytes));
+    println!(
+        "    scratch_bytes      : {} (pico estimado del paso: activaciones + logits)",
+        human(a.scratch_bytes)
+    );
+    println!(
+        "    runtime_bytes      : {} (tokenizer + índice GGUF + estado recurrente)",
+        human(a.runtime_bytes)
+    );
+    println!(
+        "    recurrent state    : {} (conv ring + GDN, incluido en runtime_bytes)",
+        human(recurrent_bytes)
+    );
+    println!(
+        "  used_controlled_bytes: {}",
+        human(a.used_controlled_bytes())
+    );
+    println!("  available_budget     : {}", human(a.available_budget()));
+    println!("  mandatory_bytes      : {}", human(a.mandatory_bytes));
+    println!("  budget_respected     : {}", a.budget_respected());
+}
+
+/// RSS e IO del proceso propio vía PowerShell (API de Windows existente, sin
+/// dependencias nuevas): PeakWorkingSet64/WorkingSet64 de Get-Process y
+/// GetProcessIoCounters de kernel32 vía Add-Type. Best-effort: cualquier
+/// fallo devuelve `None` y el reporte dice "Unavailable" (no se inventan
+/// números). Devuelve (peak_rss, rss_actual, bytes_leídos).
+fn measure_process(pid: u32) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let script = format!(
+        "$p = Get-Process -Id {pid}; \
+         Write-Output ('RSS ' + $p.PeakWorkingSet64 + ' ' + $p.WorkingSet64); \
+         try {{ \
+           Add-Type -TypeDefinition 'public static class UIo {{ [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)] public struct C {{ public ulong ro, wo, oo, rb, wb, ob; }} [System.Runtime.InteropServices.DllImport(\"kernel32.dll\")] public static extern bool GetProcessIoCounters(System.IntPtr h, out C c); }}'; \
+           $c = New-Object UIo+C; \
+           if ([UIo]::GetProcessIoCounters($p.Handle, [ref]$c)) {{ Write-Output ('IO ' + $c.rb + ' ' + $c.ro) }} else {{ Write-Output 'IO UNAVAILABLE' }} \
+         }} catch {{ Write-Output ('IO UNAVAILABLE ' + $_.Exception.Message) }}"
+    );
+    let parse_pair = |out: &std::process::Output| -> (Option<u64>, Option<u64>, Option<u64>) {
+        let mut peak = None;
+        let mut rss = None;
+        let mut read = None;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut it = line.split_whitespace();
+            match it.next() {
+                Some("RSS") => {
+                    peak = it.next().and_then(|v| v.parse().ok());
+                    rss = it.next().and_then(|v| v.parse().ok());
+                }
+                Some("IO") => {
+                    read = it.next().and_then(|v| v.parse().ok());
+                }
+                _ => {}
+            }
+        }
+        (peak, rss, read)
+    };
+    match std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+    {
+        Ok(out) if out.status.success() => parse_pair(&out),
+        Ok(out) => {
+            eprintln!(
+                "memoria: PowerShell falló ({}) — RSS/IO Unavailable",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            (None, None, None)
+        }
+        Err(e) => {
+            eprintln!("memoria: PowerShell no disponible ({e}) — RSS/IO Unavailable");
+            (None, None, None)
         }
     }
 }
@@ -527,7 +830,11 @@ fn cmd_min_forward(
     //   attn_norm ≤ 1e-5 (pairwise-f64 vs secuencial-f32, documentado);
     // - %12.4f (legacy): el redondeo de impresión es el límite — 5e-5 por
     //   valor (FLT_DECIMAL_DIG-3) en embeddings, 1e-4 en attn_norm.
-    let (emb_tol, norm_tol) = if legacy_prec { (5e-5f32, 1e-4f32) } else { (0.0f32, NORM_TOL) };
+    let (emb_tol, norm_tol) = if legacy_prec {
+        (5e-5f32, 1e-4f32)
+    } else {
+        (0.0f32, NORM_TOL)
+    };
 
     // 1) embeddings. Con bins prec9 `0.0` ES la igualdad bit a bit, no una cota.
     let oracle_emb = read_f32_bin(&dir.join("ornith-model.input_embed.f32.bin"), emb.len())?;
@@ -535,9 +842,19 @@ fn cmd_min_forward(
     println!("\npuerta embeddings (tolerancia {emb_tol:.1e}):");
     println!("  max |diff| = {e_max:.9} en [{e_at}]");
     if e_max > emb_tol {
-        return fail("embeddings", &format!("max |diff| = {e_max:.9} > {emb_tol}"));
+        return fail(
+            "embeddings",
+            &format!("max |diff| = {e_max:.9} > {emb_tol}"),
+        );
     }
-    println!("  PASS{}", if legacy_prec { " (límite de redondeo %12.4f)" } else { ": bit-idénticos al oráculo" });
+    println!(
+        "  PASS{}",
+        if legacy_prec {
+            " (límite de redondeo %12.4f)"
+        } else {
+            ": bit-idénticos al oráculo"
+        }
+    );
 
     // 2) attn_norm: ≤ 1e-5 con bins prec9, ≤ 1e-4 con legacy.
     let oracle_norm = read_f32_bin(&dir.join("ornith-attn_norm-0.f32.bin"), norm.len())?;
@@ -545,7 +862,10 @@ fn cmd_min_forward(
     println!("puerta attn_norm (tolerancia {norm_tol:.1e}):");
     println!("  max |diff| = {n_max:.9} en [{n_at}]");
     if n_max > norm_tol {
-        return fail("attn_norm", &format!("max |diff| = {n_max:.9} > {norm_tol}"));
+        return fail(
+            "attn_norm",
+            &format!("max |diff| = {n_max:.9} > {norm_tol}"),
+        );
     }
     println!("  PASS");
 
@@ -608,7 +928,10 @@ fn cmd_forward_oracle(
         let mut nodes = NodeCapture::default();
         let nodes_ref = debug_nodes.map(|_| &mut nodes);
         final_l_out = fwd.step(&mut session, &emb, Some(&mut dump), nodes_ref)?;
-        println!("  token {t} (id {tok}) listo en {:.1}s", t0.elapsed().as_secs_f64());
+        println!(
+            "  token {t} (id {tok}) listo en {:.1}s",
+            t0.elapsed().as_secs_f64()
+        );
         per_token.push(dump);
         nodes_all.push(nodes);
     }
@@ -708,7 +1031,7 @@ fn write_nodes_bin(
     buf.extend_from_slice(&(n_tokens as u32).to_le_bytes());
     for cap in per_token {
         let tok = &cap.per_token; // un Vec<(name, vals)> por token
-        // un solo token por step: per_token siempre tiene 1 entrada
+                                  // un solo token por step: per_token siempre tiene 1 entrada
         let nodes = tok.first().map(|v| v.as_slice()).unwrap_or(&[]);
         buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
         for (name, vals) in nodes {

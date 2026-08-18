@@ -68,18 +68,24 @@ impl MappedWeights {
         let meta = self
             .reader
             .find(name)
-            .ok_or_else(|| LoadError::MissingTensor { name: name.to_string() })?;
+            .ok_or_else(|| LoadError::MissingTensor {
+                name: name.to_string(),
+            })?;
         let got = meta.n_elements as usize;
         if got != n_elements {
-            return Err(LoadError::ElementCount { name: name.to_string(), got, want: n_elements });
+            return Err(LoadError::ElementCount {
+                name: name.to_string(),
+                got,
+                want: n_elements,
+            });
         }
         let nbytes = meta
             .nbytes
             .ok_or(LoadError::UnknownGgmlType(meta.ggml_type_id))?;
         let start = meta.offset as usize;
-        let end = start
-            .checked_add(nbytes as usize)
-            .ok_or_else(|| LoadError::corrupt(format!("tensor '{name}': offset+nbytes overflow")))?;
+        let end = start.checked_add(nbytes as usize).ok_or_else(|| {
+            LoadError::corrupt(format!("tensor '{name}': offset+nbytes overflow"))
+        })?;
         self.map
             .get(start..end)
             .ok_or_else(|| LoadError::corrupt(format!("tensor '{name}': bytes fuera del mapa")))

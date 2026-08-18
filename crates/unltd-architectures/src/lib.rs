@@ -25,19 +25,42 @@ pub use qwen35::{Qwen35Config, ARCH as QWEN35_ARCH};
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttnKind {
     Mha,
-    Gqa { kv_groups: u32 },
-    MlaDeepSeek { kv_lora: u32, qk_rope: u32, qk_nope: u32, v_head: u32 },
-    MlaK3NoPe { qk_nope: u32, qk_rope: u32, v_head: u32 },
+    Gqa {
+        kv_groups: u32,
+    },
+    MlaDeepSeek {
+        kv_lora: u32,
+        qk_rope: u32,
+        qk_nope: u32,
+        v_head: u32,
+    },
+    MlaK3NoPe {
+        qk_nope: u32,
+        qk_rope: u32,
+        v_head: u32,
+    },
 }
 
 /// RoPE: variantes y escalado. Las frecuencias se precalculan una vez por modelo.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RoPeKind {
     None,
-    Llama { theta: f32, dims: u32 },
+    Llama {
+        theta: f32,
+        dims: u32,
+    },
     /// YaRN (DeepSeek V2/V3): factor de escala + mscale por head-dim.
-    LlamaYaRn { theta: f32, dims: u32, factor: f32, original_max: u32, mscale: f32 },
-    NeoX { theta: f32, dims: u32 },
+    LlamaYaRn {
+        theta: f32,
+        dims: u32,
+        factor: f32,
+        original_max: u32,
+        mscale: f32,
+    },
+    NeoX {
+        theta: f32,
+        dims: u32,
+    },
 }
 
 /// FFN: densa con su activación, o MoE con su ruteo.
@@ -67,13 +90,19 @@ pub enum FfnKind {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum NormKind {
-    RmsNorm { eps: f64 },
-    LayerNorm { eps: f64 },
+    RmsNorm {
+        eps: f64,
+    },
+    LayerNorm {
+        eps: f64,
+    },
     /// RMSNorm extra sobre q/k antes de RoPE. Presente en Llama-4 (use_qk_norm),
     /// OLMo-2 (QK-norm) y Gemma (query_pre_attn_scalar). OJO con el mito: NI Qwen2.5
     /// NI Qwen3 la usan (configs verificados — campos ausentes). Atribuirla a Qwen
     /// produce un modelo que corre, fluido y equivocado.
-    QkRmsNorm { eps: f64 },
+    QkRmsNorm {
+        eps: f64,
+    },
 }
 
 /// Una capa del decoder. `attn: None` describe la capa densa 0 del linaje K3/DeepSeek

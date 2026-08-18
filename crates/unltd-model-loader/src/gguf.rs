@@ -304,10 +304,7 @@ impl GgufReader {
 
     /// Metadata por clave. Primera aparición si la clave está duplicada.
     pub fn get(&self, key: &str) -> Option<&GgufValue> {
-        self.metadata
-            .iter()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v)
+        self.metadata.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
     /// Metadata string por clave.
@@ -429,9 +426,7 @@ pub fn parse<R: Read + Seek>(r: &mut R, file_size: u64) -> Result<GgufReader, Lo
             .iter()
             .try_fold(1u64, |a, &d| a.checked_mul(d))
             .ok_or_else(|| {
-                LoadError::corrupt(format!(
-                    "tensor '{name}': element count overflows u64"
-                ))
+                LoadError::corrupt(format!("tensor '{name}': element count overflows u64"))
             })?;
         if n_elements == 0 {
             return Err(LoadError::corrupt(format!(
@@ -534,9 +529,16 @@ fn pos<R: Read + Seek>(r: &mut R) -> Result<u64, LoadError> {
 
 /// `read_exact` con checks previos: nunca se pide un buffer más allá del EOF declarado,
 /// y un EOF inesperado se reporta como archivo truncado (con offset), no como I/O genérico.
-fn read_checked<R: Read + Seek>(r: &mut R, buf: &mut [u8], file_size: u64) -> Result<(), LoadError> {
+fn read_checked<R: Read + Seek>(
+    r: &mut R,
+    buf: &mut [u8],
+    file_size: u64,
+) -> Result<(), LoadError> {
     let at = pos(r)?;
-    if at.checked_add(buf.len() as u64).map_or(true, |end| end > file_size) {
+    if at
+        .checked_add(buf.len() as u64)
+        .map_or(true, |end| end > file_size)
+    {
         return Err(LoadError::corrupt(format!(
             "read of {} bytes at offset {at} exceeds file size {file_size}",
             buf.len()
@@ -870,7 +872,7 @@ pub(crate) mod tests {
         assert_eq!(t1.nbytes, Some(68)); // ceil(33/32) × 34 = 2 bloques
         assert_eq!(t1.dtype, "Q8_0");
         assert_eq!(t1.offset, 288); // data_start + 64
-        // WeightIndex
+                                    // WeightIndex
         let idx = &g;
         assert_eq!(crate::WeightIndex::len(idx), 2);
         assert!(crate::WeightIndex::find(idx, "tok_embd.weight").is_some());
@@ -931,7 +933,13 @@ pub(crate) mod tests {
     /// Header de un tensor: magic+versión+conteos+info contiguos, sin padding.
     /// Para name "w", n_dims 1 y un dim: las infos terminan en 57 → data_start = 64.
     /// `raw_offset` es el offset RELATIVO a data_start (absoluto = data_start + raw).
-    fn header_one_tensor(name: &str, n_dims: u32, dims: &[u64], ggml_type: u32, raw_offset: u64) -> Vec<u8> {
+    fn header_one_tensor(
+        name: &str,
+        n_dims: u32,
+        dims: &[u64],
+        ggml_type: u32,
+        raw_offset: u64,
+    ) -> Vec<u8> {
         let mut w = W::new()
             .raw(b"GGUF")
             .u32(3)
@@ -979,7 +987,12 @@ pub(crate) mod tests {
         // → [64,80) > file_size 57: el archivo declara datos que no existen.
         let b = header_one_tensor("w", 1, &[4], 0, 0);
         match parse_bytes(&b) {
-            Err(LoadError::TensorOutOfBounds { name, offset, file_size, .. }) => {
+            Err(LoadError::TensorOutOfBounds {
+                name,
+                offset,
+                file_size,
+                ..
+            }) => {
                 assert_eq!(name, "w");
                 assert_eq!(offset, 64); // data_start + 0
                 assert_eq!(file_size, 57);
@@ -993,7 +1006,11 @@ pub(crate) mod tests {
         // offset relativo 100 → absoluto 164, no múltiplo de 32
         let b = header_one_tensor("w", 1, &[4], 0, 100);
         match parse_bytes(&b) {
-            Err(LoadError::MisalignedTensor { name, offset, align }) => {
+            Err(LoadError::MisalignedTensor {
+                name,
+                offset,
+                align,
+            }) => {
                 assert_eq!(name, "w");
                 assert_eq!(offset, 164); // 64 + 100
                 assert_eq!(align, 32);

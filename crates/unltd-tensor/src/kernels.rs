@@ -234,7 +234,11 @@ pub fn softplus(out: &mut [f32], x: &[f32]) {
 ///
 /// `data` son `rows` filas contiguas de largo `dim`. Bit-idéntico al oráculo.
 pub fn l2_norm_rows(data: &mut [f32], dim: usize, eps: f32) {
-    assert_eq!(data.len() % dim, 0, "l2_norm_rows: len no es múltiplo de dim");
+    assert_eq!(
+        data.len() % dim,
+        0,
+        "l2_norm_rows: len no es múltiplo de dim"
+    );
     let rows = data.len() / dim;
     for r in 0..rows {
         let row = &mut data[r * dim..(r + 1) * dim];
@@ -260,11 +264,26 @@ pub fn l2_norm_rows(data: &mut [f32], dim: usize, eps: f32) {
 /// 3 + tokens nuevos). `out`: `[channels, n_t]` → largo `channels * n_t`.
 pub fn ssm_conv(out: &mut [f32], x: &[f32], kernel: &[f32], d_conv: usize, channels: usize) {
     let ncs = x.len() / channels;
-    assert_eq!(x.len(), ncs * channels, "ssm_conv: len(x) no es múltiplo de channels");
-    assert!(ncs >= d_conv, "ssm_conv: ventana {ncs} más corta que el kernel {d_conv}");
-    assert_eq!(kernel.len(), d_conv * channels, "ssm_conv: len(kernel) != d_conv*channels");
+    assert_eq!(
+        x.len(),
+        ncs * channels,
+        "ssm_conv: len(x) no es múltiplo de channels"
+    );
+    assert!(
+        ncs >= d_conv,
+        "ssm_conv: ventana {ncs} más corta que el kernel {d_conv}"
+    );
+    assert_eq!(
+        kernel.len(),
+        d_conv * channels,
+        "ssm_conv: len(kernel) != d_conv*channels"
+    );
     let n_t = ncs - (d_conv - 1);
-    assert_eq!(out.len(), channels * n_t, "ssm_conv: len(out) != channels*n_t");
+    assert_eq!(
+        out.len(),
+        channels * n_t,
+        "ssm_conv: len(out) != channels*n_t"
+    );
     for t in 0..n_t {
         for c in 0..channels {
             let mut sumf = 0.0f32;
@@ -308,7 +327,11 @@ pub fn gdn_fused_step(
     assert_eq!(k.len(), dim, "gdn_fused_step: len(k) != dim");
     assert_eq!(v.len(), dim, "gdn_fused_step: len(v) != dim");
     assert_eq!(out.len(), dim, "gdn_fused_step: len(out) != dim");
-    assert_eq!(state.len(), dim * dim, "gdn_fused_step: len(state) != dim*dim");
+    assert_eq!(
+        state.len(),
+        dim * dim,
+        "gdn_fused_step: len(state) != dim*dim"
+    );
 
     // Réplica exacta de ggml_compute_forward_gated_delta_net_one_chunk (build
     // sin SIMD): decaimiento ggml_vec_scale_f32; dots con ggml_vec_dot_f32
@@ -453,7 +476,10 @@ mod tests {
         let mut out = [0.0f32; 4];
         rmsnorm(&mut out, &x, &[1.0f32; 4], 0.0);
         let sq = 1e8f32 * 1e8f32;
-        assert_ne!(sq as f64, 1e16f64, "sanity: el cuadrado f32 pierde precisión");
+        assert_ne!(
+            sq as f64, 1e16f64,
+            "sanity: el cuadrado f32 pierde precisión"
+        );
         let scale = 1.0f32 / (sq + 0.0f32).sqrt();
         for i in 0..4 {
             assert_eq!(out[i].to_bits(), (x[i] * scale).to_bits(), "elem {i}");
@@ -779,7 +805,16 @@ mod tests {
         // out[j] = dot(S[:,j], q), q=[1,0]: out = [3, 3].
         let mut state = [1.0f32, 0.0, 0.0, 1.0]; // S[i][j] con i=fila
         let mut out = [0.0f32; 2];
-        gdn_fused_step(&mut state, &mut out, &[1.0, 0.0], &[1.0, 1.0], &[3.0, 4.0], 0.0, 1.0, 1.0);
+        gdn_fused_step(
+            &mut state,
+            &mut out,
+            &[1.0, 0.0],
+            &[1.0, 1.0],
+            &[3.0, 4.0],
+            0.0,
+            1.0,
+            1.0,
+        );
         assert_eq!(state, [3.0, 3.0, 2.0, 4.0]);
         assert_eq!(out, [3.0, 3.0]);
 
@@ -791,7 +826,16 @@ mod tests {
         let mut state2 = prev;
         let mut out2 = [0.0f32; 2];
         let g = 0.5f32.ln(); // expf(g) = 0.5 exacto en f32? ln(0.5) no es exacto -> tolerancia
-        gdn_fused_step(&mut state2, &mut out2, &[1.0, 0.0], &[1.0, 1.0], &[3.0, 4.0], g, 1.0, 1.0);
+        gdn_fused_step(
+            &mut state2,
+            &mut out2,
+            &[1.0, 0.0],
+            &[1.0, 1.0],
+            &[3.0, 4.0],
+            g,
+            1.0,
+            1.0,
+        );
         let half = 0.5f32;
         // replicación manual en f32 (mismo orden documentado)
         let mut rep = prev;
@@ -820,7 +864,16 @@ mod tests {
         // dot(S[:,0],[1,1]) = 5, dot(S[:,1],[1,1]) = 7. Con scale=2 -> [10,14].
         let mut state = [3.0f32, 3.0, 2.0, 4.0];
         let mut out = [0.0f32; 2];
-        gdn_fused_step(&mut state, &mut out, &[1.0, 1.0], &[1.0, 1.0], &[3.0, 4.0], 0.0, 1.0, 2.0);
+        gdn_fused_step(
+            &mut state,
+            &mut out,
+            &[1.0, 1.0],
+            &[1.0, 1.0],
+            &[3.0, 4.0],
+            0.0,
+            1.0,
+            2.0,
+        );
         // d = v - dot(S,q... k): dot(S[:,0],k)=5, dot(S[:,1],k)=7 -> d=[-2,-3]
         // S += d⊗k: S[0][0]-=2 ... S = [[1,0],[0,1]]; out = dot*scale = [1,1]*2 = [2,2]
         assert_eq!(state, [1.0, 0.0, 0.0, 1.0]);

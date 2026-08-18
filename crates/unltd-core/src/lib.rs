@@ -28,7 +28,11 @@ pub enum LoadError {
     /// Tensor con element count distinto al que la config implica.
     /// Un peso con forma equivocada es un modelo distinto, no un error menor.
     #[error("tensor '{name}' has {got} elements, expected {want}")]
-    ElementCount { name: String, got: usize, want: usize },
+    ElementCount {
+        name: String,
+        got: usize,
+        want: usize,
+    },
 
     /// Tensor requerido que no está en el índice del archivo. Distinto de un
     /// archivo corrupto: el archivo es válido, le falta un peso.
@@ -42,7 +46,6 @@ pub enum LoadError {
     // ---- Errores de formato de pesos (GGUF / safetensors) ----
     // Un archivo corrupto/truncado NUNCA se degrada a "leer con ceros": eso produce
     // un modelo que corre, fluido y equivocado (lección k3_st.c, docs/AUDIT.md §3.2).
-
     /// Archivo corrupto con contexto (offsets y tamaños incluidos en el mensaje).
     #[error("corrupt file: {0}")]
     BadFile(String),
@@ -56,17 +59,33 @@ pub enum LoadError {
     UnsupportedVersion(u32),
 
     /// Un tensor declara bytes más allá del final del archivo.
-    #[error("tensor '{name}' claims bytes [{offset}, {offset}+{nbytes}) beyond file size {file_size}")]
-    TensorOutOfBounds { name: String, offset: u64, nbytes: u64, file_size: u64 },
+    #[error(
+        "tensor '{name}' claims bytes [{offset}, {offset}+{nbytes}) beyond file size {file_size}"
+    )]
+    TensorOutOfBounds {
+        name: String,
+        offset: u64,
+        nbytes: u64,
+        file_size: u64,
+    },
 
     /// Dos rangos de tensores se pisan: un archivo así no puede ser leído con
     /// confianza (el segundo tensor contendría bytes del primero).
     #[error("tensor data overlap: '{a}' ends at {a_end}, '{b}' starts at {b_start}")]
-    TensorOverlap { a: String, b: String, a_end: u64, b_start: u64 },
+    TensorOverlap {
+        a: String,
+        b: String,
+        a_end: u64,
+        b_start: u64,
+    },
 
     /// Offset de tensor no alineado a 32 (viola la spec GGUF).
     #[error("tensor '{name}' at offset {offset} is not aligned to {align} bytes")]
-    MisalignedTensor { name: String, offset: u64, align: u64 },
+    MisalignedTensor {
+        name: String,
+        offset: u64,
+        align: u64,
+    },
 
     /// Id de tipo ggml fuera de la tabla conocida. Se reporta como error solo si
     /// el llamador necesita el tamaño; el reader lo tolera con `n_bytes: None`.

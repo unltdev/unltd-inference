@@ -18,6 +18,10 @@ use std::path::Path;
 
 use unltd_core::LoadError;
 
+pub mod budget;
+
+pub use budget::{parse_size, MemoryAccounting, ParseSizeError};
+
 /// Presupuesto del motor (pesos + KV), no del proceso. `None` = "lleno" para esa clase.
 #[derive(Debug, Clone, Copy)]
 pub struct Budget {

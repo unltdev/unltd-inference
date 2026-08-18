@@ -94,8 +94,7 @@ fn byte_to_unicode() -> ([char; 256], HashMap<char, u8>) {
     let mut u2b = HashMap::new();
     let mut n = 0u32;
     for b in 0u32..256 {
-        let c = if (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b)
-        {
+        let c = if (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b) {
             char::from_u32(b).unwrap()
         } else {
             let c = char::from_u32(256 + n).unwrap();
@@ -125,7 +124,8 @@ const RE_QWEN2: &str = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD]
 
 /// GPT2 / MPT / OLMO / JAIS / TRILLION / GRANITE_DOCLING (llama-vocab.cpp ~369).
 #[cfg_attr(not(test), allow(dead_code))] // documento del patrón oráculo; lo ancla el test regex_strings_pin
-const RE_GPT2: &str = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
+const RE_GPT2: &str =
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreKind {
@@ -218,7 +218,10 @@ impl<'a> SplitCtx<'a> {
 fn split_words(text: &str, pre: PreKind) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let flags: Vec<Flags> = chars.iter().map(|&c| classify(c)).collect();
-    let ctx = SplitCtx { chars: &chars, flags: &flags };
+    let ctx = SplitCtx {
+        chars: &chars,
+        flags: &flags,
+    };
     let n = chars.len();
 
     let mut words: Vec<String> = Vec::new();
@@ -240,7 +243,11 @@ fn split_words(text: &str, pre: PreKind) -> Vec<String> {
         let case_insensitive = pre != PreKind::Gpt2;
         if cpt == '\'' && pos + 1 < n {
             let c1 = ctx.cpt(pos + 1).unwrap();
-            let n1 = if case_insensitive { lower(c1) } else { Some(c1) };
+            let n1 = if case_insensitive {
+                lower(c1)
+            } else {
+                Some(c1)
+            };
             if matches!(n1, Some('s' | 't' | 'm' | 'd')) {
                 pos += 2;
                 add_token(pos);
@@ -248,7 +255,11 @@ fn split_words(text: &str, pre: PreKind) -> Vec<String> {
             }
             if pos + 2 < n {
                 let c2 = ctx.cpt(pos + 2).unwrap();
-                let n2 = if case_insensitive { lower(c2) } else { Some(c2) };
+                let n2 = if case_insensitive {
+                    lower(c2)
+                } else {
+                    Some(c2)
+                };
                 if (n1 == Some('r') && n2 == Some('e'))
                     || (n1 == Some('v') && n2 == Some('e'))
                     || (n1 == Some('l') && n2 == Some('l'))
@@ -263,7 +274,11 @@ fn split_words(text: &str, pre: PreKind) -> Vec<String> {
         match pre {
             // ------------------------- gpt2 -------------------------
             PreKind::Gpt2 => {
-                let flags2 = if cpt == ' ' { ctx.flags(pos + 1) } else { flags };
+                let flags2 = if cpt == ' ' {
+                    ctx.flags(pos + 1)
+                } else {
+                    flags
+                };
                 // <space>?\p{L}+
                 if flags2.letter {
                     pos += (cpt == ' ') as usize;
@@ -343,7 +358,11 @@ fn split_words(text: &str, pre: PreKind) -> Vec<String> {
                     continue;
                 }
                 // <space>?[^\s\p{L}(\p{M})\p{N}]+[\r\n]*
-                let flags2 = if cpt == ' ' { ctx.flags(pos + 1) } else { flags };
+                let flags2 = if cpt == ' ' {
+                    ctx.flags(pos + 1)
+                } else {
+                    flags
+                };
                 let excluded = if with_marks {
                     flags2.ws || flags2.letter || flags2.mark || flags2.number
                 } else {
@@ -441,7 +460,10 @@ impl Gpt2Tokenizer {
                 "tokenizer.ggml.model = {model:?} — solo gpt2 (BPE byte-level) implementado"
             )));
         }
-        let pre_str = r.get_str("tokenizer.ggml.pre").unwrap_or("default").to_string();
+        let pre_str = r
+            .get_str("tokenizer.ggml.pre")
+            .unwrap_or("default")
+            .to_string();
         let pre = PreKind::from_pre(&pre_str)?;
 
         let tokens = match r.get("tokenizer.ggml.tokens") {
@@ -514,7 +536,9 @@ impl Gpt2Tokenizer {
                     "merge {rank} {m:?} con lado vacío"
                 )));
             }
-            merge_ranks.entry((l.to_string(), r.to_string())).or_insert(rank as u32);
+            merge_ranks
+                .entry((l.to_string(), r.to_string()))
+                .or_insert(rank as u32);
         }
 
         Ok(Self {
@@ -538,8 +562,11 @@ impl Gpt2Tokenizer {
         }
         // 1) split del texto CRUDO; 2) byte-encode POR PALABRA; 3) BPE; 4) lookup.
         for word in split_words(text, self.pre) {
-            let translated: String =
-                word.as_bytes().iter().map(|&b| self.b2u[b as usize]).collect();
+            let translated: String = word
+                .as_bytes()
+                .iter()
+                .map(|&b| self.b2u[b as usize])
+                .collect();
             let mut symbols: Vec<String> = translated.chars().map(|c| c.to_string()).collect();
             bpe_merge(&mut symbols, &self.merges);
             for sym in &symbols {
@@ -599,6 +626,32 @@ impl Gpt2Tokenizer {
     /// Pre-tokenizador seleccionado (para el checkpoint: "qwen35" | "qwen2" | "default").
     pub fn pre(&self) -> &str {
         &self.pre_str
+    }
+
+    /// Estimación CONSERVADORA del heap que ocupa el tokenizador en bytes,
+    /// para la contabilidad del presupuesto de memoria (Fase 9): bytes de los
+    /// Strings del vocab (más sus claves clonadas en el HashMap) + entries de
+    /// los tres mapas. Las constantes por entry son el orden del layout real
+    /// de std HashMap (String ≈ 24 B + heap; entry ≈ 1-2 palabras de
+    /// control); el RSS medido al final de la corrida es la cifra autoritativa.
+    pub fn heap_bytes(&self) -> u64 {
+        let mut b = 0u64;
+        for t in &self.tokens {
+            b += (t.len() as u64).saturating_add(48); // String 24 + slot Vec 8 + heap
+        }
+        for (l, r) in self.merges.keys() {
+            b += (l.len() as u64)
+                .saturating_add(r.len() as u64)
+                .saturating_add(88); // (String,String) 48 + u32 + entry
+        }
+        for k in self.vocab.keys() {
+            b += (k.len() as u64).saturating_add(48); // String 24 + u32 + entry
+        }
+        b += (self.char_vocab.len() as u64).saturating_mul(48); // char 4 + u32 + entry
+        b += (self.u2b.len() as u64).saturating_mul(32); // char 4 + u8 + entry
+        b = b.saturating_add(256 * 4); // b2u: [char; 256]
+        b = b.saturating_add((self.token_types.len() as u64).saturating_mul(4));
+        b.saturating_add(self.pre_str.len() as u64)
     }
 }
 
@@ -731,14 +784,33 @@ mod tests {
     ];
 
     const MERGES: &[&str] = &[
-        "T h", "Th e", // 0,1 → The
-        "Ġ c", "Ġc a", "Ġca p", "Ġcap i", "Ġcapi t", "Ġcapit a", "Ġcapita l", // 2..9 → Ġcapital
-        "Ġ o", "Ġo f", // 10,11 → Ġof
-        "Ġ F", "ĠF r", "ĠFr a", "ĠFra n", "ĠFran c", "ĠFranc e", // 12..17 → ĠFrance
-        "Ġ i", "Ġi s", // 18,19 → Ġis
-        "Ġ P", "ĠP a", "ĠPa r", "ĠPar i", "ĠPari s", // 20..24 → ĠParis
-        "c a", "ca n", // 25,26 → can
-        "' t", // 27 → 't
+        "T h",
+        "Th e", // 0,1 → The
+        "Ġ c",
+        "Ġc a",
+        "Ġca p",
+        "Ġcap i",
+        "Ġcapi t",
+        "Ġcapit a",
+        "Ġcapita l", // 2..9 → Ġcapital
+        "Ġ o",
+        "Ġo f", // 10,11 → Ġof
+        "Ġ F",
+        "ĠF r",
+        "ĠFr a",
+        "ĠFra n",
+        "ĠFran c",
+        "ĠFranc e", // 12..17 → ĠFrance
+        "Ġ i",
+        "Ġi s", // 18,19 → Ġis
+        "Ġ P",
+        "ĠP a",
+        "ĠPa r",
+        "ĠPar i",
+        "ĠPari s", // 20..24 → ĠParis
+        "c a",
+        "ca n", // 25,26 → can
+        "' t",  // 27 → 't
     ];
 
     fn fixture(pre: PreKind) -> Gpt2Tokenizer {
@@ -780,7 +852,9 @@ mod tests {
             let mut merge_ranks = HashMap::new();
             for (rank, m) in merges.iter().enumerate() {
                 let (l, r) = m.split_once(' ').unwrap();
-                merge_ranks.entry((l.to_string(), r.to_string())).or_insert(rank as u32);
+                merge_ranks
+                    .entry((l.to_string(), r.to_string()))
+                    .or_insert(rank as u32);
             }
             Ok(Self {
                 b2u,
@@ -951,7 +1025,11 @@ mod tests {
     fn pre_kinds_agree_on_oracle_prompt() {
         for pre in [PreKind::Qwen35, PreKind::Qwen2, PreKind::Gpt2] {
             let t = fixture(pre);
-            assert_eq!(encode(&t, "The capital of France is"), vec![1, 2, 3, 4, 5], "{pre:?}");
+            assert_eq!(
+                encode(&t, "The capital of France is"),
+                vec![1, 2, 3, 4, 5],
+                "{pre:?}"
+            );
         }
     }
 
@@ -959,11 +1037,14 @@ mod tests {
     /// de a un char (rama \p{N} del patrón qwen35).
     #[test]
     fn symbols_and_digits() {
-        let t = fixture(PreKind::Qwen35);
+        let _t = fixture(PreKind::Qwen35);
         // "12" → "1" y "2" como palabras separadas → char fallback (no hay
         // piezas "1"/"2" en el fixture → PieceMissing). Verificamos el split
         // directamente con split_words para no depender de piezas.
-        assert_eq!(split_words("ab 12!", PreKind::Qwen35), vec!["ab", " ", "1", "2", "!"]);
+        assert_eq!(
+            split_words("ab 12!", PreKind::Qwen35),
+            vec!["ab", " ", "1", "2", "!"]
+        );
     }
 
     /// El splitter qwen35 consume la marca de combinación junto con la letra
@@ -986,7 +1067,10 @@ mod tests {
     fn symbol_eats_trailing_newline() {
         assert_eq!(split_words("a.\nb", PreKind::Qwen35), vec!["a", ".\n", "b"]);
         // gpt2 NO tiene [\r\n]*: "." y "\n" separados.
-        assert_eq!(split_words("a.\nb", PreKind::Gpt2), vec!["a", ".", "\n", "b"]);
+        assert_eq!(
+            split_words("a.\nb", PreKind::Gpt2),
+            vec!["a", ".", "\n", "b"]
+        );
     }
 
     /// La contracción requiere una letra del set justo después del apóstrofo:
@@ -1050,7 +1134,13 @@ mod tests {
     }
 
     /// GGUF v3 con la metadata del tokenizador fixture y 0 tensores.
-    fn fixture_gguf(model: &str, pre: &str, tokens: &[&str], types: &[i32], merges: &[&str]) -> Vec<u8> {
+    fn fixture_gguf(
+        model: &str,
+        pre: &str,
+        tokens: &[&str],
+        types: &[i32],
+        _merges: &[&str],
+    ) -> Vec<u8> {
         W::new()
             .raw(b"GGUF")
             .u32(3)
@@ -1064,7 +1154,13 @@ mod tests {
             .finish()
     }
 
-    fn fixture_gguf_with_merges(model: &str, pre: &str, tokens: &[&str], types: &[i32], merges: &[&str]) -> Vec<u8> {
+    fn fixture_gguf_with_merges(
+        model: &str,
+        pre: &str,
+        tokens: &[&str],
+        types: &[i32],
+        merges: &[&str],
+    ) -> Vec<u8> {
         W::new()
             .raw(b"GGUF")
             .u32(3)
@@ -1181,7 +1277,10 @@ mod tests {
     fn regex_strings_pin() {
         assert_eq!(RE_QWEN35, "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
         assert_eq!(RE_QWEN2, "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+");
-        assert_eq!(RE_GPT2, "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)");
+        assert_eq!(
+            RE_GPT2,
+            "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)"
+        );
     }
 
     /// La tabla gpt2: printables → byte, resto ascendente → 256+.

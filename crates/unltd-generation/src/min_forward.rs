@@ -55,7 +55,9 @@ pub(crate) fn row_bytes(dtype: DType, n: usize) -> Result<usize, LoadError> {
         DType::F16 => Ok(n * 2),
         DType::Q8_0 => {
             if n % 32 != 0 {
-                return Err(LoadError::corrupt(format!("dimensión {n} no es múltiplo de 32 para Q8_0")));
+                return Err(LoadError::corrupt(format!(
+                    "dimensión {n} no es múltiplo de 32 para Q8_0"
+                )));
             }
             Ok(n / 32 * 34)
         }
@@ -65,12 +67,15 @@ pub(crate) fn row_bytes(dtype: DType, n: usize) -> Result<usize, LoadError> {
                     "dimensión {n} no es múltiplo de 256 para {dtype:?}"
                 )));
             }
-            Ok(n / 256 * match dtype {
-                DType::Q4K => 144,
-                _ => 210,
-            })
+            Ok(n / 256
+                * match dtype {
+                    DType::Q4K => 144,
+                    _ => 210,
+                })
         }
-        _ => Err(LoadError::corrupt(format!("dtype {dtype:?} sin tamaño de fila"))),
+        _ => Err(LoadError::corrupt(format!(
+            "dtype {dtype:?} sin tamaño de fila"
+        ))),
     }
 }
 
@@ -81,10 +86,13 @@ impl MinForward {
     pub fn open(weights: MappedWeights) -> Result<Self, LoadError> {
         let cfg = Qwen35Config::from_gguf(weights.reader())?;
 
-        let emb_meta = weights
-            .reader()
-            .find("token_embd.weight")
-            .ok_or_else(|| LoadError::MissingTensor { name: "token_embd.weight".to_string() })?;
+        let emb_meta =
+            weights
+                .reader()
+                .find("token_embd.weight")
+                .ok_or_else(|| LoadError::MissingTensor {
+                    name: "token_embd.weight".to_string(),
+                })?;
         if emb_meta.shape.len() != 2 {
             return Err(LoadError::corrupt(format!(
                 "token_embd.weight: se esperaban 2 dims, hay {}",
@@ -101,7 +109,9 @@ impl MinForward {
             });
         }
         if vocab == 0 {
-            return Err(LoadError::corrupt("token_embd.weight: vocab = 0".to_string()));
+            return Err(LoadError::corrupt(
+                "token_embd.weight: vocab = 0".to_string(),
+            ));
         }
 
         let emb_dtype = dtype_of(emb_meta)?;
@@ -125,7 +135,13 @@ impl MinForward {
             });
         }
 
-        Ok(Self { cfg, weights, vocab, emb_row_bytes, emb_dtype })
+        Ok(Self {
+            cfg,
+            weights,
+            vocab,
+            emb_row_bytes,
+            emb_dtype,
+        })
     }
 
     pub fn vocab(&self) -> usize {
@@ -172,7 +188,11 @@ impl MinForward {
     /// soporte de aliasing in-place y el contrato no lo asume.
     pub fn attn_norm_rows(&self, x: &[f32]) -> Result<Vec<f32>, LoadError> {
         let n = self.cfg.n_embd;
-        assert_eq!(x.len() % n, 0, "attn_norm_rows: len(x) no es múltiplo de n_embd");
+        assert_eq!(
+            x.len() % n,
+            0,
+            "attn_norm_rows: len(x) no es múltiplo de n_embd"
+        );
         let w = self.weights.tensor_checked("blk.0.attn_norm.weight", n)?;
         let w: &[f32] = bytemuck::cast_slice(w);
         let mut out = vec![0.0f32; x.len()];
@@ -189,12 +209,16 @@ impl MinForward {
     /// El input debe ser el `result_norm` del oráculo (n_embd floats).
     pub fn output_logits(&self, result_norm: &[f32]) -> Result<Vec<f32>, LoadError> {
         let n = self.cfg.n_embd;
-        assert_eq!(result_norm.len(), n, "output_logits: len(result_norm) != n_embd");
-        let meta = self
-            .weights
-            .reader()
-            .find("output.weight")
-            .ok_or_else(|| LoadError::MissingTensor { name: "output.weight".to_string() })?;
+        assert_eq!(
+            result_norm.len(),
+            n,
+            "output_logits: len(result_norm) != n_embd"
+        );
+        let meta = self.weights.reader().find("output.weight").ok_or_else(|| {
+            LoadError::MissingTensor {
+                name: "output.weight".to_string(),
+            }
+        })?;
         if meta.shape[0] as usize != n || meta.shape[1] as usize != self.vocab {
             return Err(LoadError::ElementCount {
                 name: "output.weight".to_string(),
@@ -212,7 +236,10 @@ impl MinForward {
                 want: expect as usize,
             });
         }
-        let w = self.weights.tensor("output.weight").expect("validado arriba");
+        let w = self
+            .weights
+            .tensor("output.weight")
+            .expect("validado arriba");
 
         let mut logits = vec![0.0f32; self.vocab];
         use rayon::prelude::*;
@@ -228,7 +255,9 @@ impl MinForward {
                 let rows = &w[j0 * row_bytes..(j0 + c) * row_bytes];
                 match dtype {
                     // el oráculo dota los pesos K-quant contra x cuantizado a Q8_K
-                    DType::Q4K | DType::Q6K => gemv_quant_q8k(chunk, result_norm, rows, n, c, dtype),
+                    DType::Q4K | DType::Q6K => {
+                        gemv_quant_q8k(chunk, result_norm, rows, n, c, dtype)
+                    }
                     // F32/Q8_0: camino existente (Q8_0 usa vec_dot Q8_0, no Q8_K)
                     _ => gemv_quant(chunk, result_norm, rows, n, c, dtype),
                 }

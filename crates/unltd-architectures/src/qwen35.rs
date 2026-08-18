@@ -173,14 +173,24 @@ impl Qwen35Config {
 
     fn check(&self) -> Result<(), LoadError> {
         let c = |cond: bool, msg: String| {
-            if cond { Ok(()) } else { Err(LoadError::StructCheck(msg)) }
+            if cond {
+                Ok(())
+            } else {
+                Err(LoadError::StructCheck(msg))
+            }
         };
         c(self.n_layer >= 1, "block_count = 0".into())?;
-        c(self.n_embd > 0 && self.n_ff > 0, "dims de embedding/FFN nulos".into())?;
+        c(
+            self.n_embd > 0 && self.n_ff > 0,
+            "dims de embedding/FFN nulos".into(),
+        )?;
         c(self.n_head >= 1, "attention.head_count = 0".into())?;
         c(
             self.n_head_kv >= 1 && self.n_head % self.n_head_kv == 0,
-            format!("GQA inválida: n_head={} n_head_kv={}", self.n_head, self.n_head_kv),
+            format!(
+                "GQA inválida: n_head={} n_head_kv={}",
+                self.n_head, self.n_head_kv
+            ),
         )?;
         c(
             self.n_head * self.head_dim == self.n_embd,
@@ -199,7 +209,10 @@ impl Qwen35Config {
         )?;
         c(
             self.n_rot % 2 == 0 && self.n_rot <= self.head_dim,
-            format!("n_rot={} inválido (par y ≤ head_dim={})", self.n_rot, self.head_dim),
+            format!(
+                "n_rot={} inválido (par y ≤ head_dim={})",
+                self.n_rot, self.head_dim
+            ),
         )?;
         c(self.freq_base > 0.0, "rope.freq_base <= 0".into())?;
         c(self.rms_eps > 0.0, "layer_norm_rms_epsilon <= 0".into())?;
@@ -207,7 +220,10 @@ impl Qwen35Config {
         c(self.group_count >= 1, "ssm.group_count = 0".into())?;
         c(
             self.d_inner % (2 * self.group_count) == 0,
-            format!("d_inner={} no es múltiplo de 2×group_count={}", self.d_inner, self.group_count),
+            format!(
+                "d_inner={} no es múltiplo de 2×group_count={}",
+                self.d_inner, self.group_count
+            ),
         )?;
         c(self.time_step_rank >= 1, "ssm.time_step_rank = 0".into())?;
         c(
@@ -218,7 +234,10 @@ impl Qwen35Config {
                 self.head_dim_linear()
             ),
         )?;
-        c(self.full_attn_interval >= 1, "full_attention_interval = 0".into())?;
+        c(
+            self.full_attn_interval >= 1,
+            "full_attention_interval = 0".into(),
+        )?;
         c(
             self.rope_sections.len() == 4,
             format!(
@@ -452,9 +471,18 @@ mod tests {
             Err(LoadError::MissingConfig { n, fields }) => {
                 assert_eq!(n, 18);
                 assert!(fields.contains("qwen35.block_count"), "fields: {fields}");
-                assert!(fields.contains("qwen35.ssm.conv_kernel"), "fields: {fields}");
-                assert!(fields.contains("qwen35.rope.dimension_sections"), "fields: {fields}");
-                assert!(fields.contains("qwen35.full_attention_interval"), "fields: {fields}");
+                assert!(
+                    fields.contains("qwen35.ssm.conv_kernel"),
+                    "fields: {fields}"
+                );
+                assert!(
+                    fields.contains("qwen35.rope.dimension_sections"),
+                    "fields: {fields}"
+                );
+                assert!(
+                    fields.contains("qwen35.full_attention_interval"),
+                    "fields: {fields}"
+                );
             }
             other => panic!("esperaba MissingConfig, obtuve {other:?}"),
         }
@@ -489,7 +517,10 @@ mod tests {
         match parse_cfg(&b) {
             Err(LoadError::MissingConfig { n, fields }) => {
                 assert_eq!(n, 2);
-                assert!(fields.contains("qwen35.ssm.conv_kernel"), "fields: {fields}");
+                assert!(
+                    fields.contains("qwen35.ssm.conv_kernel"),
+                    "fields: {fields}"
+                );
                 assert!(fields.contains("qwen35.rope.freq_base"), "fields: {fields}");
             }
             other => panic!("esperaba MissingConfig, obtuve {other:?}"),
@@ -529,7 +560,9 @@ mod tests {
             .kv_u32("qwen35.full_attention_interval", 4)
             .finish();
         match parse_cfg(&b) {
-            Err(LoadError::BadFile(msg)) => assert!(msg.contains("qwen35.block_count"), "msg: {msg}"),
+            Err(LoadError::BadFile(msg)) => {
+                assert!(msg.contains("qwen35.block_count"), "msg: {msg}")
+            }
             other => panic!("esperaba BadFile, obtuve {other:?}"),
         }
 
@@ -552,31 +585,46 @@ mod tests {
     #[test]
     fn structural_checks_refuse() {
         // wq: head_count × key_length debe cubrir n_embd exacto
-        match parse_cfg(&fixture_with(Fx { n_embd: 4097, ..Default::default() })) {
+        match parse_cfg(&fixture_with(Fx {
+            n_embd: 4097,
+            ..Default::default()
+        })) {
             Err(LoadError::StructCheck(msg)) => assert!(msg.contains("wq"), "msg: {msg}"),
             other => panic!("esperaba StructCheck, obtuve {other:?}"),
         }
 
         // state_size debe ser el head dim lineal
-        match parse_cfg(&fixture_with(Fx { state: 64, ..Default::default() })) {
+        match parse_cfg(&fixture_with(Fx {
+            state: 64,
+            ..Default::default()
+        })) {
             Err(LoadError::StructCheck(msg)) => assert!(msg.contains("state_size"), "msg: {msg}"),
             other => panic!("esperaba StructCheck, obtuve {other:?}"),
         }
 
         // n_rot debe ser par
-        match parse_cfg(&fixture_with(Fx { n_rot: 63, ..Default::default() })) {
+        match parse_cfg(&fixture_with(Fx {
+            n_rot: 63,
+            ..Default::default()
+        })) {
             Err(LoadError::StructCheck(msg)) => assert!(msg.contains("n_rot"), "msg: {msg}"),
             other => panic!("esperaba StructCheck, obtuve {other:?}"),
         }
 
         // key_length != value_length
-        match parse_cfg(&fixture_with(Fx { val_len: 128, ..Default::default() })) {
+        match parse_cfg(&fixture_with(Fx {
+            val_len: 128,
+            ..Default::default()
+        })) {
             Err(LoadError::StructCheck(msg)) => assert!(msg.contains("value_length"), "msg: {msg}"),
             other => panic!("esperaba StructCheck, obtuve {other:?}"),
         }
 
         // d_inner no divisible por 2×group_count
-        match parse_cfg(&fixture_with(Fx { d_inner: 4097, ..Default::default() })) {
+        match parse_cfg(&fixture_with(Fx {
+            d_inner: 4097,
+            ..Default::default()
+        })) {
             Err(LoadError::StructCheck(msg)) => assert!(msg.contains("d_inner"), "msg: {msg}"),
             other => panic!("esperaba StructCheck, obtuve {other:?}"),
         }
@@ -618,4 +666,3 @@ fn type_name(v: &GgufValue) -> String {
         },
     }
 }
-
