@@ -73,7 +73,20 @@ def process_stream(stream, out_dir: Path) -> dict:
             name, ne0, ne1 = m.group(1), int(m.group(2)), int(m.group(3))
             if name in TARGETS:
                 w0, w1 = TARGETS[name]
-                assert (ne0, ne1) == (w0, w1), f"{name}: ne={{ {ne0}, {ne1} }} != {TARGETS[name]}"
+                if (ne0, ne1) != (w0, w1):
+                    # El grafo repite nodos con distinta forma (p. ej. `norm`:
+                    # RMS_NORM {4096,5} en la capa final y GET_ROWS {4096,1}
+                    # en la selección de resultado; input_embed {4096,1} en
+                    # pasos de decode). No aborta: se salta el bloque y el
+                    # check final de `missing` informa si nunca apareció la
+                    # forma buscada.
+                    print(
+                        f"WARNING: {name} con forma {{{ne0}, {ne1}}} != "
+                        f"{{{w0}, {w1}}} — bloque saltado",
+                        file=sys.stderr,
+                    )
+                    state = None
+                    continue
                 state = {"name": name, "pending": 2, "vals": []}
                 continue
         if state is not None:

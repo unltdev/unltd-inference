@@ -52,6 +52,12 @@ enum Cmd {
         /// Directorio con los bins del oráculo (ornith-*.f32.bin).
         #[arg(long)]
         oracle_dir: Option<PathBuf>,
+
+        /// Bins del volcado legacy %12.4f: relaja las puertas al límite del
+        /// redondeo de impresión (embeddings ≤ 5e-5, attn_norm ≤ 1e-4) en
+        /// lugar de bit-exacto / 1e-5 (solo válido con bins %.9g).
+        #[arg(long)]
+        legacy_prec: bool,
     },
 
     /// Tokeniza texto con el tokenizador del modelo (Fase 6).
@@ -94,8 +100,8 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::MinForward { model, tokens, oracle_dir } => {
-            if let Err(e) = cmd_min_forward(&model, &tokens, oracle_dir.as_deref()) {
+        Cmd::MinForward { model, tokens, oracle_dir, legacy_prec } => {
+            if let Err(e) = cmd_min_forward(&model, &tokens, oracle_dir.as_deref(), legacy_prec) {
                 eprintln!("unltd min-forward: {e}");
                 std::process::exit(1);
             }
@@ -204,7 +210,12 @@ const ORACLE_PROMPT_TOKENS: [u32; 5] = [760, 6511, 314, 9338, 369];
 /// diferencia de orden + precisión cabe en 1e-5 (docs/AUDIT.md §3.3).
 const NORM_TOL: f32 = 1e-5;
 
-fn cmd_min_forward(model: &Path, tokens: &str, oracle_dir: Option<&Path>) -> Result<(), LoadError> {
+fn cmd_min_forward(
+    model: &Path,
+    tokens: &str,
+    oracle_dir: Option<&Path>,
+    legacy_prec: bool,
+) -> Result<(), LoadError> {
     let ids: Vec<u32> = tokens
         .split(',')
         .map(|s| {
@@ -250,24 +261,30 @@ fn cmd_min_forward(model: &Path, tokens: &str, oracle_dir: Option<&Path>) -> Res
         return Ok(());
     };
 
-    // 1) embeddings: bit-idénticos al oráculo (mismo dequantize Q4_K en f32).
-    // `!= 0.0` es deliberado: la puerta ES la igualdad bit a bit, no una cota.
+    // Tolerancias por precisión del oráculo:
+    // - %.9g (prec9): embeddings bit-exactos (0.0, mismo dequantize Q4_K) y
+    //   attn_norm ≤ 1e-5 (pairwise-f64 vs secuencial-f32, documentado);
+    // - %12.4f (legacy): el redondeo de impresión es el límite — 5e-5 por
+    //   valor (FLT_DECIMAL_DIG-3) en embeddings, 1e-4 en attn_norm.
+    let (emb_tol, norm_tol) = if legacy_prec { (5e-5f32, 1e-4f32) } else { (0.0f32, NORM_TOL) };
+
+    // 1) embeddings. Con bins prec9 `0.0` ES la igualdad bit a bit, no una cota.
     let oracle_emb = read_f32_bin(&dir.join("ornith-model.input_embed.f32.bin"), emb.len())?;
     let (e_max, e_at) = max_abs_diff(&emb, &oracle_emb);
-    println!("\npuerta embeddings (bit-exact):");
+    println!("\npuerta embeddings (tolerancia {emb_tol:.1e}):");
     println!("  max |diff| = {e_max:.9} en [{e_at}]");
-    if e_max != 0.0 {
-        return fail("embeddings", &format!("max |diff| = {e_max:.9} (debe ser 0.0)"));
+    if e_max > emb_tol {
+        return fail("embeddings", &format!("max |diff| = {e_max:.9} > {emb_tol}"));
     }
-    println!("  PASS: bit-idénticos al oráculo");
+    println!("  PASS{}", if legacy_prec { " (límite de redondeo %12.4f)" } else { ": bit-idénticos al oráculo" });
 
-    // 2) attn_norm: ≤ 1e-5 (pairwise-f64 vs secuencial-f32, documentado).
+    // 2) attn_norm: ≤ 1e-5 con bins prec9, ≤ 1e-4 con legacy.
     let oracle_norm = read_f32_bin(&dir.join("ornith-attn_norm-0.f32.bin"), norm.len())?;
     let (n_max, n_at) = max_abs_diff(&norm, &oracle_norm);
-    println!("puerta attn_norm (tolerancia {NORM_TOL}):");
+    println!("puerta attn_norm (tolerancia {norm_tol:.1e}):");
     println!("  max |diff| = {n_max:.9} en [{n_at}]");
-    if n_max > NORM_TOL {
-        return fail("attn_norm", &format!("max |diff| = {n_max:.9} > {NORM_TOL}"));
+    if n_max > norm_tol {
+        return fail("attn_norm", &format!("max |diff| = {n_max:.9} > {norm_tol}"));
     }
     println!("  PASS");
 
