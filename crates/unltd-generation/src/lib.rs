@@ -21,8 +21,10 @@
 //!   corrupción numérica que parece una corrida buena.
 
 pub mod min_forward;
+pub mod qwen35_forward;
 
 pub use min_forward::MinForward;
+pub use qwen35_forward::{LayerDump, NodeCapture, Qwen35Forward, Qwen35Session};
 
 use unltd_architectures::ModelSpec;
 use unltd_core::{LoadError, WeightId};

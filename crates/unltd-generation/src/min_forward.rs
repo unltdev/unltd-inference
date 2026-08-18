@@ -20,7 +20,7 @@
 use unltd_architectures::qwen35::Qwen35Config;
 use unltd_core::LoadError;
 use unltd_model_loader::{MappedWeights, TensorMeta, WeightIndex};
-use unltd_tensor::{dequantize_q4_k, gemv_quant, rmsnorm, DType};
+use unltd_tensor::{dequantize_q4_k, gemv_quant, gemv_quant_q8k, rmsnorm, DType};
 
 /// Modelo qwen3.5 abierto, validado y listo para el forward mínimo.
 pub struct MinForward {
@@ -36,7 +36,7 @@ pub struct MinForward {
 
 /// dtype de motor para un tensor del índice. Negativa ante cualquier id ggml
 /// que el motor no sabe interpretar — nunca se adivina.
-fn dtype_of(meta: &TensorMeta) -> Result<DType, LoadError> {
+pub(crate) fn dtype_of(meta: &TensorMeta) -> Result<DType, LoadError> {
     match meta.ggml_type_id {
         0 => Ok(DType::F32),
         1 => Ok(DType::F16),
@@ -49,7 +49,7 @@ fn dtype_of(meta: &TensorMeta) -> Result<DType, LoadError> {
 
 /// Bytes de una fila empaquetada de dimensión `n` (dims múltiplo del bloque;
 /// GGUF exige padding de bloque para los quants — el check es una negativa).
-fn row_bytes(dtype: DType, n: usize) -> Result<usize, LoadError> {
+pub(crate) fn row_bytes(dtype: DType, n: usize) -> Result<usize, LoadError> {
     match dtype {
         DType::F32 => Ok(n * 4),
         DType::F16 => Ok(n * 2),
@@ -132,6 +132,12 @@ impl MinForward {
         self.vocab
     }
 
+    /// Los pesos mapeados (índice + bytes por mmap). El forward completo
+    /// (Fase 6) lee las capas a través de este acceso, sin re-mapear el archivo.
+    pub(crate) fn weights(&self) -> &MappedWeights {
+        &self.weights
+    }
+
     /// Lookup de embeddings: dequantiza (Q4_K) o copia (F32) las filas de
     /// `token_embd.weight` para cada token. Un token fuera del vocab es un
     /// ERROR, no un clamp.
@@ -172,7 +178,7 @@ impl MinForward {
         let mut out = vec![0.0f32; x.len()];
         let mut scratch = vec![0.0f32; n];
         for (src, dst) in x.chunks_exact(n).zip(out.chunks_exact_mut(n)) {
-            rmsnorm(&mut scratch, src, w, self.cfg.rms_eps as f64);
+            rmsnorm(&mut scratch, src, w, self.cfg.rms_eps);
             dst.copy_from_slice(&scratch);
         }
         Ok(out)
@@ -219,14 +225,13 @@ impl MinForward {
             .for_each(|(ci, chunk)| {
                 let j0 = ci * CHUNK_ROWS;
                 let c = chunk.len();
-                gemv_quant(
-                    chunk,
-                    result_norm,
-                    &w[j0 * row_bytes..(j0 + c) * row_bytes],
-                    n,
-                    c,
-                    dtype,
-                );
+                let rows = &w[j0 * row_bytes..(j0 + c) * row_bytes];
+                match dtype {
+                    // el oráculo dota los pesos K-quant contra x cuantizado a Q8_K
+                    DType::Q4K | DType::Q6K => gemv_quant_q8k(chunk, result_norm, rows, n, c, dtype),
+                    // F32/Q8_0: camino existente (Q8_0 usa vec_dot Q8_0, no Q8_K)
+                    _ => gemv_quant(chunk, result_norm, rows, n, c, dtype),
+                }
             });
         Ok(logits)
     }

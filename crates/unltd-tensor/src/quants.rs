@@ -20,6 +20,13 @@
 //!    los productos, nunca en el orden;
 //! 4. el resultado es un parcial f64; el llamador lo acumula en f64 (ver
 //!    `matmul_f32_acc` para el patrón de acumulación).
+//!
+//! **Excepción — los dots Q8_K** ([`dot_q4_k_q8_k`] / [`dot_q6_k_q8_k`]): el
+//! oráculo los ejecuta con `ggml_vec_dot_q4_K_q8_K` / `q6_K`, que en su build
+//! MSVC cae a los kernels GENERIC (GGML_AVX2=OFF en build-msvc/CMakeCache.txt).
+//! Ahí NO rige el contrato f64: estos dos dots son réplicas escalares EXACTAS de
+//! esos generics (ggml-cpu/quants.c:645 y :800) — carriles i32, d f32,
+//! mul/add f32 separados sin FMA — bit-idénticos a lo que midió el oráculo.
 
 use crate::kernels::pairwise_sum_f64;
 
@@ -188,6 +195,214 @@ pub fn dot_q6_k(x: &[f32], w: &[u8]) -> f64 {
     pairwise_sum_f64(&prods)
 }
 
+// ---------------------------------------------------------------------------
+// Camino del ORÁCULO: MUL_MAT con x cuantizado a Q8_K.
+//
+// ggml-cpu no dota el vector f32 contra los pesos cuantizados: para Q4_K/Q6_K
+// su `vec_dot_type` es GGML_TYPE_Q8_K (ggml-cpu.c:304-313), así que ANTES del
+// dot cuantiza `x` a block_q8_K con `quantize_row_q8_K_ref` (ggml-quants.c:2696)
+// — una cuantización CON pérdida (~0.4% por elemento). El dot resultante NO es
+// el dot matemáticamente exacto del contrato §3.3: es el dot que ejecuta el
+// oráculo, y el gate exige replicarlo bit a bit. Los kernels de aquí replican
+// en escalar las versiones AVX2 de ggml_vec_dot_q4_K_q8_K (arch/x86/quants.c:2038)
+// y ggml_vec_dot_q6_K_q8_K (arch/x86/quants.c:2426), incluida la aritmética:
+//
+// - sumas de enteros EXACTAS en i32 por carril (8 carriles idénticos a AVX2);
+// - cadenas FMA f32 por carril: `acc[k] = fma(d, sumi[k] as f32, acc[k])`;
+// - suma horizontal de los 8 carriles en el orden exacto de hsum_float_8
+//   (arch/x86/quants.c:43): ((a4+a0)+(a6+a2)) + ((a5+a1)+(a7+a3));
+// - término dmin en 4 carriles (q4_K): ((m0+m2)+(m1+m3)) al final.
+//
+// Los dots exactos ([`dot_q4_k`] / [`dot_q6_k`]) siguen existiendo como
+// referencia matemática y para los tests; el forward usa gemv_quant_q8k.
+// ---------------------------------------------------------------------------
+
+/// Redondeo a entero de ggml (`nearest_int`, ggml-quants.c:563): el truco del
+/// número mágico. `val = f + 12582912.f` redondea en f32 a entero (ties-to-even,
+/// el rango de trabajo es [2^23, 2^24) donde ulp = 1) y los 23 bits de mantisa
+/// contienen el entero desplazado por 0x400000. Replica EXACTA, incluido el
+/// desempate a par (2.5 → 2, 3.5 → 4).
+#[inline]
+fn nearest_int(fval: f32) -> i32 {
+    let val = fval + 12582912.0f32;
+    ((val.to_bits() & 0x007f_ffff) as i32) - 0x0040_0000
+}
+
+/// Bloque Q8_K: `{float d; int8 qs[256]; int16 bsums[16]}` (ggml-common.h).
+/// `d` es f32 (verificado por static_assert en ggml-common.h:364-366).
+#[derive(Debug, Clone, Copy)]
+pub struct Q8KBlock {
+    pub d: f32,
+    pub qs: [i8; 256],
+    pub bsums: [i32; 16],
+}
+
+/// Replica exacta de `quantize_row_q8_K_ref` (ggml-quants.c:2696):
+/// por bloque de 256: max con SIGNO (primer argmax estricto de |x|); si amax = 0
+/// el bloque queda d = 0 y qs = 0 (ggml deja bsums sin tocar — irrelevante porque
+/// d = 0 anula todo uso de bsums; aquí se ponen a 0 por higiene);
+/// `iscale = -127.f/max` (f32); `qs[j] = MIN(127, nearest_int(iscale*x[j]))`;
+/// `bsums[j] = Σ16 qs`; `d = 1/iscale`.
+pub fn quantize_q8_k(x: &[f32]) -> Vec<Q8KBlock> {
+    assert_eq!(x.len() % QK_K, 0, "quantize_q8_k: len no es múltiplo de {QK_K}");
+    let mut out = Vec::with_capacity(x.len() / QK_K);
+    for chunk in x.chunks_exact(QK_K) {
+        let mut max = 0.0f32;
+        let mut amax = 0.0f32;
+        for &v in chunk {
+            let ax = v.abs();
+            if ax > amax {
+                amax = ax;
+                max = v;
+            }
+        }
+        let mut b = Q8KBlock {
+            d: 0.0,
+            qs: [0; QK_K],
+            bsums: [0; 16],
+        };
+        if amax == 0.0 {
+            out.push(b);
+            continue;
+        }
+        let iscale = -127.0f32 / max;
+        for j in 0..QK_K {
+            b.qs[j] = nearest_int(iscale * chunk[j]).min(127) as i8;
+        }
+        for j in 0..16 {
+            b.bsums[j] = b.qs[16 * j..16 * j + 16]
+                .iter()
+                .map(|&q| i32::from(q))
+                .sum();
+        }
+        b.d = 1.0f32 / iscale;
+        out.push(b);
+    }
+    out
+}
+
+/// Dot Q8_K×Q4_K, réplica escalar EXACTA de `ggml_vec_dot_q4_K_q8_K_generic`
+/// (ggml-cpu/quants.c:645). El build MSVC del oráculo está configurado con
+/// GGML_AVX=OFF y GGML_AVX2=OFF (build-msvc/CMakeCache.txt), así que la rama
+/// SIMD de arch/x86/quants.c NO se compiló y `ggml_vec_dot_q4_K_q8_K` cae al
+/// generic — medido contra el volcado: la suma del tensor z-0 solo cierra con
+/// la aritmética del generic (el AVX2 replica diverge ~3e-6/elem).
+/// Por bloque (nb = 16 en ornith):
+/// - nibbles de `qs` expandidos en orden de elemento: `a[e]` = nibble bajo si
+///   `e%64 < 32`, alto si no;
+/// - dance `utmp` (== [`scale_min_k4`]): sc[0..7] (uno por grupo de 32),
+///   m[0..7] (uno por par de bsums);
+/// - 8 carriles i32: carril k acumula los elementos e ≡ k (mod 8):
+///   `aux32[k] += sc[e/32] · (a[e] · q8[e])` — productos i16/i32 EXACTOS;
+/// - `sums[k] += d * aux32[k]` en f32 con mul y add SEPARADOS (sin FMA — MSVC
+///   sin /arch:AVX2 no emite FMA), `d = f16(x.d) * y.d`;
+/// - `sumi = Σ_{g=0..15} bsums[g]·m[g/2]` (i32 exacto, orden ascendente);
+///   `sumf -= dmin * sumi` con `dmin = f16(x.dmin) * y.d` POSITIVO (el signo
+///   menos va en la resta — NO es el `-y.d*f16(x.dmin)` del AVX2);
+/// - `s = ((sumf + sums[0]) + sums[1]) + ... + sums[7]` (secuencial, DESPUÉS
+///   de todas las restas dmin).
+pub fn dot_q4_k_q8_k(x: &[Q8KBlock], w: &[u8]) -> f32 {
+    assert_eq!(
+        w.len() % BLOCK_Q4_K_BYTES,
+        0,
+        "dot_q4_k_q8_k: len(w) != bloques exactos"
+    );
+    assert_eq!(
+        x.len(),
+        w.len() / BLOCK_Q4_K_BYTES,
+        "dot_q4_k_q8_k: bloques de x ({}) != bloques de w ({})",
+        x.len(),
+        w.len() / BLOCK_Q4_K_BYTES
+    );
+    let mut sums = [0.0f32; 8];
+    let mut sumf = 0.0f32;
+    for (q8, block) in x.iter().zip(w.chunks_exact(BLOCK_Q4_K_BYTES)) {
+        let mut sc = [0u8; 8];
+        let mut m = [0u8; 8];
+        for g in 0..8 {
+            let (s, mn) = scale_min_k4(&block[4..16], g);
+            sc[g] = s;
+            m[g] = mn;
+        }
+        let qs = &block[16..];
+        let mut sumi = [0i32; 8];
+        for e in 0..QK_K {
+            let pos = e % 64;
+            let byte = qs[32 * (e / 64) + pos % 32];
+            let a = if pos < 32 { byte & 0xF } else { byte >> 4 };
+            sumi[e % 8] += i32::from(sc[e / 32]) * i32::from(a) * i32::from(q8.qs[e]);
+        }
+        let d = q8.d * f16_to_f32(f16_at(&block[0..2]));
+        for k in 0..8 {
+            // mul y add f32 SEPARADOS: el generic no usa FMA
+            sums[k] += d * sumi[k] as f32;
+        }
+        let mut minsum = 0i32;
+        for g in 0..16 {
+            minsum += q8.bsums[g] * i32::from(m[g / 2]);
+        }
+        let dmin = f16_to_f32(f16_at(&block[2..4])) * q8.d;
+        sumf -= dmin * minsum as f32;
+    }
+    let mut s = sumf;
+    for k in 0..8 {
+        s += sums[k];
+    }
+    s
+}
+
+/// Dot Q8_K×Q6_K, réplica escalar EXACTA de `ggml_vec_dot_q6_K_q8_K_generic`
+/// (ggml-cpu/quants.c:800) — mismo motivo que en [`dot_q4_k_q8_k`]: el build
+/// del oráculo compiló solo el generic. Por bloque:
+/// - `a[e]` = valor 6-bit crudo del elemento e (nib ql | 2 bits qh) MENOS 32
+///   (el −32 va DENTRO de a — no hay término q8sclsub como en el AVX2);
+/// - 8 carriles i32: `aux32[k] += sc[e/16]·(a[e]·q8[e])` con sc i8 CON signo;
+/// - `sums[k] += d * aux32[k]` (f32, mul+add separados), `d = f16(x.d) * y.d`;
+/// - `s = sums[0] + ... + sums[7]` secuencial (sumf arranca en 0 — Q6_K no
+///   tiene término de mínimos).
+pub fn dot_q6_k_q8_k(x: &[Q8KBlock], w: &[u8]) -> f32 {
+    assert_eq!(
+        w.len() % BLOCK_Q6_K_BYTES,
+        0,
+        "dot_q6_k_q8_k: len(w) != bloques exactos"
+    );
+    assert_eq!(
+        x.len(),
+        w.len() / BLOCK_Q6_K_BYTES,
+        "dot_q6_k_q8_k: bloques de x ({}) != bloques de w ({})",
+        x.len(),
+        w.len() / BLOCK_Q6_K_BYTES
+    );
+    let mut sums = [0.0f32; 8];
+    for (q8, block) in x.iter().zip(w.chunks_exact(BLOCK_Q6_K_BYTES)) {
+        let ql = &block[0..128];
+        let qh = &block[128..192];
+        let scales = &block[192..208];
+        let mut sumi = [0i32; 8];
+        for e in 0..QK_K {
+            // mapeo de dequantize_row_q6_K_reference: por chunk de 128, los
+            // primeros 64 elementos usan los nibbles BAJOS de ql[pos%64] y los
+            // últimos 64 los ALTOS (q1/q2: ql[l]&0xF y ql[l+32]&0xF; q3/q4:
+            // ql[l]>>4 y ql[l+32]>>4).
+            let pos = e % 128;
+            let byte = ql[64 * (e / 128) + pos % 64];
+            let nib = if pos < 64 { byte & 0xF } else { byte >> 4 };
+            let hi2 = (qh[32 * (e / 128) + pos % 32] >> (2 * (pos / 32))) & 3;
+            let a = i32::from(nib | (hi2 << 4)) - 32; // crudo − 32
+            sumi[e % 8] += i32::from(scales[e / 16] as i8) * a * i32::from(q8.qs[e]);
+        }
+        let d = q8.d * f16_to_f32(f16_at(&block[208..210]));
+        for k in 0..8 {
+            sums[k] += d * sumi[k] as f32;
+        }
+    }
+    let mut s = 0.0f32;
+    for k in 0..8 {
+        s += sums[k];
+    }
+    s
+}
+
 /// GEMV sobre una matriz de pesos empaquetados: `out[j] = Σ_i x[i] * w[i, j]`.
 /// La matriz `w` es `[dim_in, dim_out]` con filas de `dim_in` contiguas (como las
 /// escribe GGUF); cada fila es un vector de bloques del dtype.
@@ -224,6 +439,47 @@ pub fn gemv_quant(out: &mut [f32], x: &[f32], w: &[u8], dim_in: usize, dim_out: 
             _ => dot_q6_k(x, row),
         };
         out[j] = sum as f32;
+    }
+}
+
+/// GEMV como lo ejecuta el ORÁCULO (ggml_compute_forward_mul_mat): cuantiza `x`
+/// a Q8_K UNA vez (como hace ggml con src1 para vec_dot_type = Q8_K) y dota cada
+/// fila con el kernel q8_K del dtype de la fila. Es CON pérdida respecto del dot
+/// exacto (~0.4%/elemento de x); es lo que corre llama.cpp y lo que el gate
+/// compara. F32 no tiene sentido aquí (el oráculo usa vec_dot f32 directo, sin
+/// cuantizar): se rechaza explícito.
+pub fn gemv_quant_q8k(
+    out: &mut [f32],
+    x: &[f32],
+    w: &[u8],
+    dim_in: usize,
+    dim_out: usize,
+    dtype: crate::DType,
+) {
+    assert_eq!(out.len(), dim_out, "gemv_quant_q8k: len(out) != dim_out");
+    assert!(x.len() >= dim_in, "gemv_quant_q8k: len(x) < dim_in");
+    let row_bytes = match dtype {
+        crate::DType::Q4K | crate::DType::Q6K => {
+            assert_eq!(dim_in % QK_K, 0, "gemv_quant_q8k: dim_in no es múltiplo de {QK_K}");
+            dim_in / QK_K
+                * match dtype {
+                    crate::DType::Q4K => BLOCK_Q4_K_BYTES,
+                    _ => BLOCK_Q6_K_BYTES,
+                }
+        }
+        other => panic!(
+            "gemv_quant_q8k: dtype {other:?} no usa vec_dot Q8_K en el oráculo (usa gemv_quant)"
+        ),
+    };
+    assert_eq!(w.len(), row_bytes * dim_out, "gemv_quant_q8k: len(w) != filas exactas");
+    let x = &x[..dim_in];
+    let xq = quantize_q8_k(x);
+    for j in 0..dim_out {
+        let row = &w[j * row_bytes..(j + 1) * row_bytes];
+        out[j] = match dtype {
+            crate::DType::Q4K => dot_q4_k_q8_k(&xq, row),
+            _ => dot_q6_k_q8_k(&xq, row),
+        };
     }
 }
 
@@ -656,6 +912,137 @@ mod tests {
         // (nib 0 NO es peso 0 en Q6_K: el cero está en q=32).
         // bloque 1: -31 + 15·(-32) = -511; bloque 2 (d=2): -62 + 15·(-64) = -1022
         assert_eq!(dot_q6_k(&x, &w), -511.0 + -1022.0);
+    }
+
+    #[test]
+    fn nearest_int_replicates_ggml_magic() {
+        // ties-to-even del truco del número mágico (2.5 → 2, 3.5 → 4)
+        assert_eq!(nearest_int(0.0), 0);
+        assert_eq!(nearest_int(2.5), 2);
+        assert_eq!(nearest_int(3.5), 4);
+        assert_eq!(nearest_int(-3.5), -4);
+        assert_eq!(nearest_int(126.7), 127);
+        assert_eq!(nearest_int(-126.7), -127);
+        assert_eq!(nearest_int(0.5), 0);
+        assert_eq!(nearest_int(1.5), 2);
+    }
+
+    #[test]
+    fn quantize_q8_k_hand_block_and_zero_block() {
+        // x = [1, 0, ...]: max = 1 → iscale = -127 → qs[0] = -127, d = -1/127
+        let mut x = [0.0f32; 256];
+        x[0] = 1.0;
+        let q = quantize_q8_k(&x);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q[0].qs[0], -127);
+        assert!(q[0].qs[1..].iter().all(|&v| v == 0));
+        assert_eq!(q[0].bsums[0], -127);
+        assert!(q[0].bsums[1..].iter().all(|&v| v == 0));
+        assert_eq!(q[0].d, 1.0f32 / -127.0f32);
+
+        // max negativo: x[0] = -1 → iscale = 127 → qs[0] = -127, d = 1/127
+        let mut x = [0.0f32; 256];
+        x[0] = -1.0;
+        let q = quantize_q8_k(&x);
+        assert_eq!(q[0].qs[0], -127);
+        assert_eq!(q[0].d, 1.0f32 / 127.0f32);
+
+        // bloque todo cero: d = 0, qs = 0 (ggml no toca bsums; d=0 lo anula todo)
+        let z = [0.0f32; 256];
+        let q = quantize_q8_k(&z);
+        assert_eq!(q[0].d, 0.0);
+        assert!(q[0].qs.iter().all(|&v| v == 0));
+
+        // dos bloques: stride de 256
+        let mut two = [0.0f32; 512];
+        two[256] = 2.0;
+        let q = quantize_q8_k(&two);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q[0].d, 0.0);
+        assert_eq!(q[1].qs[0], -127); // iscale = -127/2 → 2·-63.5 = -127
+    }
+
+    #[test]
+    fn dot_q4_k_q8_k_hand_values() {
+        // Semántica del kernel GENERIC (quants.c:645). pesos: d = 1 (f16),
+        // dmin = 2 (f16), g0: sc = 1 / m = 3, elem0 nib = 1.
+        // x = one-hot(0) = 127: xq d = -1, qs[0] = -127, bs[0] = -127.
+        // sumi[0] = sc[0]·a[0]·q8[0] = 1·1·(-127) = -127; d = q8.d·f16(d) = -1
+        // → sums[0] += -1·(-127) = 127 (mul + add separados).
+        // minsum = bs[0]·m[0] = -127·3 = -381; dmin = f16(dmin)·q8.d = 2·(-1) = -2
+        // → sumf -= (-2)·(-381) = -762. Total = -762 + 127 = -635.
+        let mut scales = [0u8; 12];
+        scales[0] = 1;
+        scales[4] = 3;
+        let mut qs = [0u8; 128];
+        qs[0] = 0x01; // elem0 = 1, elem1 = 0
+        let block = q4_block(F16_ONE, F16_TWO, scales, qs);
+        let mut x = [0.0f32; 256];
+        x[0] = 127.0;
+        let got = dot_q4_k_q8_k(&quantize_q8_k(&x), &block);
+        assert_eq!(got, -635.0); // exacto: d, dmin, sumi y minsum son enteros·potencias
+    }
+
+    #[test]
+    fn dot_q6_k_q8_k_hand_values() {
+        // Semántica del kernel GENERIC (quants.c:800). pesos: d = 1 (f16),
+        // sc[0] = 1, elem0 raw = 1 (ql[0] = 0x01). x = one-hot(0) = 127:
+        // xq d = -1, qs[0] = -127.
+        // a[0] = raw − 32 = -31; sumi[0] = sc[0]·a[0]·q8[0] = 1·(-31)·(-127) = 3937
+        // → sums[0] += -1·3937 = -3937. Comprobación exacta:
+        // w0 = d·sc·(raw-32) = 1·(1-32) = -31; x0·w0 = 127·(-31) = -3937.
+        let mut ql = [0u8; 128];
+        ql[0] = 0x01;
+        let mut scales = [0i8; 16];
+        scales[0] = 1;
+        let block = q6_block(F16_ONE, ql, [0; 64], scales);
+        let mut x = [0.0f32; 256];
+        x[0] = 127.0;
+        let got = dot_q6_k_q8_k(&quantize_q8_k(&x), &block);
+        assert_eq!(got, -3937.0);
+
+        // Escala negativa: sc[2] = -1, elem 32 raw = 1 (ql[32] = 0x01 → nibble
+        // BAJO, chunk de 128: elem 32 usa ql[32]&0xF), x one-hot(32) = 127.
+        // El −32 va dentro de a[32] = 1−32 = -31, MISMO carril 0 que su escala
+        // sc[2] (no hay corrección por carril en el generic):
+        // sumi[0] += -1·(-31)·(-127) = -3937 → sums[0] += -1·(-3937) = 3937.
+        // Verificación real: w32 = d·sc·(raw-32) = 1·(-1)·(-31) = 31;
+        // x·w = 127·31 = 3937.
+        let mut ql = [0u8; 128];
+        ql[32] = 0x01;
+        let mut scales = [0i8; 16];
+        scales[2] = -1;
+        let block = q6_block(F16_ONE, ql, [0; 64], scales);
+        let mut x = [0.0f32; 256];
+        x[32] = 127.0;
+        let got = dot_q6_k_q8_k(&quantize_q8_k(&x), &block);
+        assert_eq!(got, 3937.0);
+    }
+
+    #[test]
+    fn q8k_dots_close_to_exact_dots() {
+        // Sanidad sobre los bytes REALES clavados de ornith: el dot q8_K pierde
+        // ~0.4%/elemento de x (cuantización de x), el exacto no. Cota holgada.
+        let xp: Vec<f32> = (0..256)
+            .map(|i| ((i * 7919) % 1009) as f32 / 1009.0 - 0.5)
+            .collect();
+        let q = quantize_q8_k(&xp);
+        for raw in [Q4K_B0.as_slice(), Q4K_B15.as_slice()] {
+            let exact = dot_q4_k(&xp, raw);
+            let via_q8k = f64::from(dot_q4_k_q8_k(&q, raw));
+            assert!(
+                (exact - via_q8k).abs() < 0.5,
+                "q4_k: exact {exact} vs q8k {via_q8k}"
+            );
+        }
+        for raw in [Q6K_B0.as_slice(), Q6K_B15.as_slice()] {
+            let exact = dot_q6_k(&xp, raw);
+            let via_q8k = f64::from(dot_q6_k_q8_k(&q, raw));
+            assert!(
+                (exact - via_q8k).abs() < 0.5,
+                "q6_k: exact {exact} vs q8k {via_q8k}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

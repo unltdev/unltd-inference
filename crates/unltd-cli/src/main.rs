@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use unltd_core::{human, LoadError};
-use unltd_generation::MinForward;
+use unltd_generation::{LayerDump, MinForward, NodeCapture, Qwen35Forward};
 use unltd_model_loader::{GgufReader, MappedWeights};
 
 #[derive(Parser, Debug)]
@@ -58,6 +58,29 @@ enum Cmd {
         /// lugar de bit-exacto / 1e-5 (solo válido con bins %.9g).
         #[arg(long)]
         legacy_prec: bool,
+    },
+
+    /// Prefill de los 5 tokens del oráculo por las 32 capas (Fase 6):
+    /// escribe las salidas por capa y por token a un binario f32 para
+    /// `compare-layers-oracle.py` y, con `--oracle-dir` (bins prec9),
+    /// gata result_norm y el argmax de los logits contra el oráculo.
+    ForwardOracle {
+        /// Modelo: archivo .gguf.
+        model: PathBuf,
+
+        /// Directorio donde escribir `engine-layers.f32.bin` + summary.
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+
+        /// Directorio con los bins prec9 del oráculo (puertas de cola).
+        #[arg(long)]
+        oracle_dir: Option<PathBuf>,
+
+        /// Si se pasa, escribe los nodos intermedios del camino recurrente a
+        /// este binario (para `compare-nodes-oracle.py`): [u32 n_tokens] y por
+        /// token [u32 n_nodes], por nodo [u32 name_len][name][u32 ne0][f32×ne0].
+        #[arg(long)]
+        debug_nodes: Option<PathBuf>,
     },
 
     /// Tokeniza texto con el tokenizador del modelo (Fase 6).
@@ -106,10 +129,19 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Cmd::ForwardOracle { model, out_dir, oracle_dir, debug_nodes } => {
+            if let Err(e) =
+                cmd_forward_oracle(&model, &out_dir, oracle_dir.as_deref(), debug_nodes.as_deref())
+            {
+                eprintln!("unltd forward-oracle: {e}");
+                std::process::exit(1);
+            }
+        }
         Cmd::Tokenize { .. } | Cmd::Run { .. } => {
             eprintln!(
-                "unltd: este comando llega en la Fase 6 (ver docs/ROADMAP.md). \
-                 Hoy existen `inspect` (Fase 2) y `min-forward` (Fase 5)."
+                "unltd: este comando llega en la Fase 7 (ver docs/ROADMAP.md). \
+                 Hoy existen `inspect` (Fase 2), `min-forward` (Fase 5) y \
+                 `forward-oracle` (Fase 6)."
             );
             std::process::exit(2);
         }
@@ -308,6 +340,160 @@ fn cmd_min_forward(
 
     println!("\nMIN-FORWARD PASS: las tres puertas en verde.");
     Ok(())
+}
+
+/// Prefill completo Fase 6: los 5 tokens del oráculo por las 32 capas.
+///
+/// Escribe `engine-layers.f32.bin` (formato de compare-layers-oracle.py:
+/// [u32 n_layer][u32 n_tokens][u32 n_embd] y por (capa, token) los tres
+/// vectores l_out, attn_residual, linear_attn_out en f32 LE) y un summary de
+/// cola (result_norm, argmax, top-5). Con `--oracle-dir` (bins prec9) gata:
+/// result_norm ≤ 1e-4 y argmax == oráculo (11751).
+fn cmd_forward_oracle(
+    model: &Path,
+    out_dir: &Path,
+    oracle_dir: Option<&Path>,
+    debug_nodes: Option<&Path>,
+) -> Result<(), LoadError> {
+    let fwd = Qwen35Forward::open(MappedWeights::open(model)?)?;
+    let n = fwd.cfg.n_embd;
+    let n_layer = fwd.cfg.n_layer;
+    let n_tokens = ORACLE_PROMPT_TOKENS.len();
+
+    println!("modelo : {}", model.display());
+    println!("arch   : qwen35 (Fase 6, 32 capas)");
+    println!("tokens : {ORACLE_PROMPT_TOKENS:?} (ctx de sesión = {n_tokens})");
+
+    let mut session = fwd.new_session(n_tokens);
+    let mut per_token: Vec<LayerDump> = Vec::with_capacity(n_tokens);
+    let mut nodes_all: Vec<NodeCapture> = Vec::with_capacity(n_tokens);
+    let mut final_l_out = Vec::new();
+    let t0 = std::time::Instant::now();
+    for (t, &tok) in ORACLE_PROMPT_TOKENS.iter().enumerate() {
+        let emb = fwd.embed(&[tok])?;
+        let mut dump = LayerDump {
+            attn_residual: vec![0.0f32; n_layer * n],
+            l_out: vec![0.0f32; n_layer * n],
+            linear_attn_out: vec![0.0f32; n_layer * n],
+        };
+        let mut nodes = NodeCapture::default();
+        let nodes_ref = debug_nodes.map(|_| &mut nodes);
+        final_l_out = fwd.step(&mut session, &emb, Some(&mut dump), nodes_ref)?;
+        println!("  token {t} (id {tok}) listo en {:.1}s", t0.elapsed().as_secs_f64());
+        per_token.push(dump);
+        nodes_all.push(nodes);
+    }
+
+    std::fs::create_dir_all(out_dir)
+        .map_err(|e| LoadError::corrupt(format!("crear {}: {e}", out_dir.display())))?;
+    let bin_path = out_dir.join("engine-layers.f32.bin");
+    write_layers_bin(&bin_path, &per_token, n_layer, n_tokens, n)?;
+    println!(
+        "capas    : {} ({} bytes)",
+        bin_path.display(),
+        bin_path.metadata().map(|m| m.len()).unwrap_or(0)
+    );
+
+    if let Some(dn) = debug_nodes {
+        write_nodes_bin(dn, &nodes_all, n_tokens)?;
+        println!(
+            "nodos    : {} ({} bytes)",
+            dn.display(),
+            dn.metadata().map(|m| m.len()).unwrap_or(0)
+        );
+    }
+
+    // Cola: result_norm + logits del último token.
+    let rn = fwd.output_norm(&final_l_out)?;
+    let logits = fwd.output_logits(&rn)?;
+    let (mine_idx, mine_top) = top5(&logits);
+    println!("cola     : result_norm max |x| = {:.6}", max_abs(&rn));
+    println!("           argmax = {mine_idx}, top-5 = {mine_top:?}");
+    if let Some(dir) = oracle_dir {
+        let oracle_rn = read_f32_bin(&dir.join("ornith-result_norm.f32.bin"), n)?;
+        let oracle_out = read_f32_bin(&dir.join("ornith-result_output.f32.bin"), fwd.vocab())?;
+        let (ora_idx, ora_top) = top5(&oracle_out);
+        let (rn_max, rn_at) = max_abs_diff(&rn, &oracle_rn);
+        let (l_max, l_at) = max_abs_diff(&logits, &oracle_out);
+        println!("puerta result_norm (tolerancia 1e-4):");
+        println!("  max |diff| = {rn_max:.9} en [{rn_at}]");
+        if rn_max > 1e-4 {
+            return fail("result_norm", &format!("max |diff| = {rn_max:.9} > 1e-4"));
+        }
+        println!("  PASS");
+        println!("puerta logits (argmax == oráculo):");
+        println!("  max |diff| = {l_max:.9} en [{l_at}] (Q8_K del oráculo + diffs de capas, informativo)");
+        println!("  argmax     : mine {mine_idx}, oráculo {ora_idx}");
+        println!("  top-5      : mine {mine_top:?}");
+        println!("               ora  {ora_top:?}");
+        if mine_idx != ora_idx {
+            return fail("logits", &format!("argmax {mine_idx} != oráculo {ora_idx}"));
+        }
+        println!("  PASS");
+    }
+
+    println!("\nFORWARD-ORACLE OK: ahora comparar capas con compare-layers-oracle.py.");
+    Ok(())
+}
+
+/// Escribe el binario de capas: header (3×u32) + por (capa, token) los tres
+/// vectores l_out / attn_residual / linear_attn_out en f32 LE, capa-major.
+fn write_layers_bin(
+    path: &Path,
+    per_token: &[LayerDump],
+    n_layer: usize,
+    n_tokens: usize,
+    n: usize,
+) -> Result<(), LoadError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(12 + n_layer * n_tokens * 3 * n * 4);
+    buf.extend_from_slice(&(n_layer as u32).to_le_bytes());
+    buf.extend_from_slice(&(n_tokens as u32).to_le_bytes());
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
+    for il in 0..n_layer {
+        for t in 0..n_tokens {
+            let base = il * n;
+            let push = |buf: &mut Vec<u8>, v: &[f32]| {
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            };
+            push(&mut buf, &per_token[t].l_out[base..base + n]);
+            push(&mut buf, &per_token[t].attn_residual[base..base + n]);
+            push(&mut buf, &per_token[t].linear_attn_out[base..base + n]);
+        }
+    }
+    std::fs::write(path, buf)
+        .map_err(|e| LoadError::corrupt(format!("escribir {}: {e}", path.display())))
+}
+
+/// Escribe los nodos capturados: [u32 n_tokens] y por token [u32 n_nodes],
+/// por nodo [u32 name_len][name bytes][u32 ne0][f32×ne0] (LE). Los nodos son
+/// los intermedios del camino recurrente capturados en `Qwen35Forward::step`.
+fn write_nodes_bin(
+    path: &Path,
+    per_token: &[NodeCapture],
+    n_tokens: usize,
+) -> Result<(), LoadError> {
+    assert_eq!(per_token.len(), n_tokens);
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&(n_tokens as u32).to_le_bytes());
+    for cap in per_token {
+        let tok = &cap.per_token; // un Vec<(name, vals)> por token
+        // un solo token por step: per_token siempre tiene 1 entrada
+        let nodes = tok.first().map(|v| v.as_slice()).unwrap_or(&[]);
+        buf.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+        for (name, vals) in nodes {
+            let name = name.as_bytes();
+            buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(&(vals.len() as u32).to_le_bytes());
+            for x in vals {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+    }
+    std::fs::write(path, buf)
+        .map_err(|e| LoadError::corrupt(format!("escribir {}: {e}", path.display())))
 }
 
 /// Fallo numérico de una puerta: exit 3 (distinto de errores de carga) +

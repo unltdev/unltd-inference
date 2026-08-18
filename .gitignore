@@ -3,3 +3,9 @@ Cargo.lock.orig
 *.tmp
 # Logs de sesiones de desarrollo (crash/API tests), no son artefactos del proyecto
 *.log
+
+# Artefactos regenerables del oráculo/motor (bins y dumps grandes)
+benchmarks/reference/ornith-prec9-ffn0.txt
+benchmarks/reference/engine-nodes.f32.bin
+benchmarks/reference/engine-layers.f32.bin
+benchmarks/reference/__pycache__/

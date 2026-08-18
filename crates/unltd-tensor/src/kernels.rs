@@ -41,23 +41,39 @@ pub(crate) fn pairwise_sum_f64(vals: &[f64]) -> f64 {
     level.first().copied().unwrap_or(0.0)
 }
 
-/// RMSNorm: `out[i] = w[i] * x[i] / sqrt(mean(x^2) + eps)`, con eps DENTRO de la
-/// raíz (como K3; DeepSeek/Qwen también lo definen así).
+/// RMSNorm + multiplicación por pesos: `out[i] = x[i] * scale * w[i]` con
+/// `scale = 1/sqrtf(mean(x²) + eps)` — réplica BIT-EXACTA del camino del
+/// oráculo ggml (`ggml_compute_forward_rms_norm_f32` + MUL separado; la
+/// variante fusionada `RMS_NORM+MUL` tiene la MISMA aritmética):
 ///
-/// Contrato: Σ x² en f64 con partición por pares ([`pairwise_sum_f64`]); la salida
-/// se computa en f64 con orden fijo `((x * w) * inv_rms)` y se redondea a f32.
-pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f64) {
+/// ```c
+/// ggml_float sum = 0.0;
+/// for (i) sum += (ggml_float)(x[i] * x[i]); // producto EN F32 → suma f64 secuencial
+/// const float mean  = sum / n;              // división f64 → redondea a f32
+/// const float scale = 1.0f / sqrtf(mean + eps); // suma, raíz y división en f32
+/// norm[i] = x[i] * scale;                   // mul f32
+/// out[i]  = norm[i] * w[i];                 // mul f32 (el MUL separado)
+/// ```
+///
+/// NOTA: nada de suma pairwise ni f64 en los productos — el oráculo redondea
+/// cada paso a f32. Una diferencia de 1 ulp aquí produce "flips" de qs en la
+/// cuantización Q8_K de los gemvs aguas abajo (~1e-4 de ruido por flip).
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
     assert_eq!(out.len(), x.len(), "rmsnorm: len(out) != len(x)");
     assert_eq!(x.len(), w.len(), "rmsnorm: len(x) != len(w)");
     let n = x.len();
     if n == 0 {
         return;
     }
-    let sq: Vec<f64> = x.iter().map(|&v| (v as f64) * (v as f64)).collect();
-    let mean_sq = pairwise_sum_f64(&sq) / n as f64;
-    let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+    let mut sum: f64 = 0.0;
+    for &v in x {
+        sum += (v * v) as f64;
+    }
+    let mean = (sum / n as f64) as f32;
+    let scale = 1.0f32 / (mean + eps).sqrt();
     for i in 0..n {
-        out[i] = ((x[i] as f64) * (w[i] as f64) * inv_rms) as f32;
+        let norm = x[i] * scale;
+        out[i] = norm * w[i];
     }
 }
 
@@ -152,17 +168,16 @@ pub fn softmax(out: &mut [f32], x: &[f32], scale: f32) {
     }
 }
 
-/// SwiGLU: `out[i] = silu(gate[i]) * up[i]`, con `silu(x) = x / (1 + e^(-x))`.
-///
-/// Contrato: cómputo en f64 con orden fijo: `t = gate; s = 1/(1+exp(-t));
-/// out = (t * s) * up`, redondeado a f32.
+/// SwiGLU: `out[i] = silu(gate[i]) * up[i]` — réplica f32 de
+/// `ggml_vec_swiglu_f32` (vec.cpp): `y = ggml_silu_f32(x) * g` con
+/// `silu(x) = x / (1.0f + expf(-x))`, TODO en f32 (expf, suma, división, mul).
 pub fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32]) {
     assert_eq!(out.len(), gate.len(), "swiglu: len(out) != len(gate)");
     assert_eq!(gate.len(), up.len(), "swiglu: len(gate) != len(up)");
     for i in 0..gate.len() {
-        let t = gate[i] as f64;
-        let s = 1.0 / (1.0 + (-t).exp());
-        out[i] = (t * s * (up[i] as f64)) as f32;
+        let t = gate[i];
+        let s = t / (1.0f32 + (-t).exp());
+        out[i] = s * up[i];
     }
 }
 
@@ -178,35 +193,36 @@ pub fn gelu_tanh(out: &mut [f32], x: &[f32]) {
     }
 }
 
-/// Sigmoid elementwise: `1 / (1 + e^-x)`, en f64 (misma convención que [`swiglu`];
-/// ggml lo hace en f32 — la diferencia es ≤ 1 ulp y no observable en el gate).
+/// Sigmoid elementwise — réplica f32 de ggml (`ggml_sigmoid_f32`):
+/// `1.0f / (1.0f + expf(-x))`, todo en f32.
 pub fn sigmoid(out: &mut [f32], x: &[f32]) {
     assert_eq!(out.len(), x.len(), "sigmoid: len(out) != len(x)");
     for i in 0..x.len() {
-        let t = x[i] as f64;
-        out[i] = (1.0 / (1.0 + (-t).exp())) as f32;
+        out[i] = 1.0f32 / (1.0f32 + (-x[i]).exp());
     }
 }
 
-/// SiLU elementwise: `x * sigmoid(x)`, en f64. Usa el mismo orden fijo que
-/// [`swiglu`] (`(t * s)`), sin el producto por `up`.
+/// SiLU elementwise — réplica f32 de ggml (`ggml_silu_f32`, vec.h):
+/// `x / (1.0f + expf(-x))`, todo en f32.
 pub fn silu(out: &mut [f32], x: &[f32]) {
     assert_eq!(out.len(), x.len(), "silu: len(out) != len(x)");
     for i in 0..x.len() {
-        let t = x[i] as f64;
-        let s = 1.0 / (1.0 + (-t).exp());
-        out[i] = (t * s) as f32;
+        out[i] = x[i] / (1.0f32 + (-x[i]).exp());
     }
 }
 
-/// Softplus elementwise: `ln(1 + e^x)`, en f64. Para x grande el f64 no desborda
-/// (la referencia ggml usa `log1pf(expf(x))` en f32 y devuelve inf cuando expf
-/// desborda — régimen donde el modelo diverge de todos modos).
+/// Softplus elementwise — réplica f32 de ggml (`op_softplus`, unary-ops.cpp):
+/// `(x > 20.0f) ? x : logf(1.0f + expf(x))`, todo en f32. (No log1pf: ggml usa
+/// `logf(1+expf(x))`.)
 pub fn softplus(out: &mut [f32], x: &[f32]) {
     assert_eq!(out.len(), x.len(), "softplus: len(out) != len(x)");
     for i in 0..x.len() {
-        let t = x[i] as f64;
-        out[i] = (1.0 + t.exp()).ln() as f32;
+        let t = x[i];
+        out[i] = if t > 20.0f32 {
+            t
+        } else {
+            (1.0f32 + t.exp()).ln()
+        };
     }
 }
 
@@ -257,6 +273,77 @@ pub fn ssm_conv(out: &mut [f32], x: &[f32], kernel: &[f32], d_conv: usize, chann
             }
             out[t * channels + c] = sumf;
         }
+    }
+}
+
+/// Un paso del núcleo GatedDeltaNet FUSED (referencia: el bucle interno de
+/// `ggml_compute_forward_gated_delta_net_one_chunk`, ggml-cpu/ops.cpp — el kernel
+/// que usó el oráculo, rama `kda=false` de gate escalar; build SIN SIMD, verificado
+/// en el vcxproj: sin /arch → ggml_vec_dot_f32/mad_f32 scalar):
+///
+/// 1. `S *= expf(gate)` — toda la matriz por el escalar (f32 expf, multiplicación f32);
+/// 2. por columna `j`: `d[j] = (v[j] - dot(S[:,j], k)) * beta` — el dot acumula
+///    productos f32 en f64 SECUENCIAL (ggml_vec_dot_f32 scalar) y redondea a f32;
+///    la resta y el producto por beta en f32;
+/// 3. `S[i][j] += d[j] * k[i]` con mul + add SEPARADOS (ggml_vec_mad_f32 scalar,
+///    SIN FMA — el build del oráculo no tiene /arch y MSVC no contrae);
+/// 4. `out[j] = dot(S_nueva[:,j], q) * scale` — **la escala va sobre la SALIDA**
+///    (así lo hace el camino fused; el no-fused escala q primero).
+///
+/// Layout: `state` es la matriz 128×128 del v-head en orden de filas `S[i][j]`
+/// (`i` = dim del producto con k/q, `j` = dim de v/out). El mapeo q/k-head →
+/// v-head (`h % 16`) es responsabilidad del llamador, igual que en ggml.
+/// `dim = q.len() == k.len() == v.len() == out.len()`, `state.len() == dim*dim`.
+pub fn gdn_fused_step(
+    state: &mut [f32],
+    out: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: f32,
+    beta: f32,
+    scale: f32,
+) {
+    let dim = q.len();
+    assert_eq!(k.len(), dim, "gdn_fused_step: len(k) != dim");
+    assert_eq!(v.len(), dim, "gdn_fused_step: len(v) != dim");
+    assert_eq!(out.len(), dim, "gdn_fused_step: len(out) != dim");
+    assert_eq!(state.len(), dim * dim, "gdn_fused_step: len(state) != dim*dim");
+
+    // Réplica exacta de ggml_compute_forward_gated_delta_net_one_chunk (build
+    // sin SIMD): decaimiento ggml_vec_scale_f32; dots con ggml_vec_dot_f32
+    // SCALAR (productos f32 → acumulación f64 SECUENCIAL → redondeo f32); y
+    // mad con ggml_vec_mad_f32 scalar (`y += x*v`, mul + add SIN FMA).
+    //
+    // 1) decaimiento: S *= expf(gate)
+    let g_exp = gate.exp();
+    for s in state.iter_mut() {
+        *s *= g_exp;
+    }
+
+    // 2) delta por columna j: d[j] = (v[j] - dot(S[:,j], k)) * beta
+    let mut d = vec![0.0f32; dim];
+    for j in 0..dim {
+        let mut sum: f64 = 0.0;
+        for i in 0..dim {
+            sum += (state[i * dim + j] * k[i]) as f64;
+        }
+        let sum = sum as f32;
+        d[j] = (v[j] - sum) * beta;
+    }
+    // 3) actualización: S[i][j] += d[j] * k[i]  (mul + add, sin FMA)
+    for j in 0..dim {
+        for i in 0..dim {
+            state[i * dim + j] += k[i] * d[j];
+        }
+    }
+    // 4) salida: out[j] = dot(S_nueva[:,j], q) * scale
+    for j in 0..dim {
+        let mut sum: f64 = 0.0;
+        for i in 0..dim {
+            sum += (state[i * dim + j] * q[i]) as f64;
+        }
+        out[j] = sum as f32 * scale;
     }
 }
 
@@ -344,35 +431,32 @@ mod tests {
         rmsnorm(&mut out, &x, &x, 0.0);
         assert_eq!(out, [1.0; 4]);
 
-        // x = [3, 4], eps = 0: mean_sq = (9+16)/2 = 12.5 EXACTO en f64,
-        // esperado = ((x * w) * (1/sqrt(12.5))) redondeado a f32
+        // x = [3, 4], eps = 0, w = 1: réplica ggml — cuadrados exactos aquí;
+        // mean y scale en f32, DOS muls f32 ((x*scale)*w). El contrato viejo
+        // (triple producto f64 con una sola redondez) daría OTROS bits.
         let x = [3.0f32, 4.0];
-        let w = [1.0f32, 1.0];
         let mut out = [0.0f32; 2];
-        rmsnorm(&mut out, &x, &w, 0.0);
-        let e0 = ((3.0f64) * (1.0f64) * (1.0 / 12.5f64.sqrt())) as f32;
-        let e1 = ((4.0f64) * (1.0f64) * (1.0 / 12.5f64.sqrt())) as f32;
-        assert_eq!(out[0].to_bits(), e0.to_bits());
-        assert_eq!(out[1].to_bits(), e1.to_bits());
+        rmsnorm(&mut out, &x, &[1.0, 1.0], 0.0);
+        let mean = ((9.0f64 + 16.0) / 2.0) as f32;
+        let scale = 1.0f32 / (mean + 0.0f32).sqrt();
+        assert_eq!(out[0].to_bits(), (3.0f32 * scale).to_bits());
+        assert_eq!(out[1].to_bits(), (4.0f32 * scale).to_bits());
 
         // eps DENTRO de la raíz: x = 0, eps = 1e-6 → out = 0
         let mut out = [0.0f32; 2];
         rmsnorm(&mut out, &[0.0, 0.0], &[2.0, 3.0], 1e-6);
         assert_eq!(out, [0.0, 0.0]);
 
-        // squares con rango grande: la suma f64 de cuadrados es exacta en este
-        // régimen (1e16 tiene ulp 65536, y +1 ni siquiera redondea). Con entradas
-        // todas positivas el orden no es observable a través de la salida f32; el
-        // orden queda clavado por el test del helper y, en Fase 4, por el test de
-        // bit-identidad scalar ≡ AVX2.
-        let x = [1e8f32, 1.0, 1e8, 1.0];
+        // cuadrados EN F32 (no (v as f64)²): 1e8² en f32 no es 1e16 exacto.
+        // La suma f64 secuencial de 4 términos iguales es exacta → mean = sq.
+        let x = [1e8f32, 1e8, 1e8, 1e8];
         let mut out = [0.0f32; 4];
         rmsnorm(&mut out, &x, &[1.0f32; 4], 0.0);
-        let mean_sq_pairwise = 2e16f64 / 4.0; // = 5e15 exacto
-        let inv = 1.0 / mean_sq_pairwise.sqrt();
-        for (i, &v) in x.iter().enumerate() {
-            let e = ((v as f64) * (1.0f64) * inv) as f32;
-            assert_eq!(out[i].to_bits(), e.to_bits(), "elem {i}");
+        let sq = 1e8f32 * 1e8f32;
+        assert_ne!(sq as f64, 1e16f64, "sanity: el cuadrado f32 pierde precisión");
+        let scale = 1.0f32 / (sq + 0.0f32).sqrt();
+        for i in 0..4 {
+            assert_eq!(out[i].to_bits(), (x[i] * scale).to_bits(), "elem {i}");
         }
     }
 
@@ -685,5 +769,101 @@ mod tests {
         let table = vec![0.0f32; 6];
         let mut out = [0.0f32; 4];
         embedding_lookup(&mut out, &table, &[0, 99], 2);
+    }
+
+    #[test]
+    fn gdn_fused_step_hand_values() {
+        // dim=2, estado identidad, gate=0 (exp=1), beta=1, scale=1.
+        // d[j] = v[j] - dot(S[:,j], k): d[0] = 3-1 = 2, d[1] = 4-1 = 3.
+        // S += d⊗k: [[1+2, 0+3], [0+2, 1+3]] = [[3,3],[2,4]].
+        // out[j] = dot(S[:,j], q), q=[1,0]: out = [3, 3].
+        let mut state = [1.0f32, 0.0, 0.0, 1.0]; // S[i][j] con i=fila
+        let mut out = [0.0f32; 2];
+        gdn_fused_step(&mut state, &mut out, &[1.0, 0.0], &[1.0, 1.0], &[3.0, 4.0], 0.0, 1.0, 1.0);
+        assert_eq!(state, [3.0, 3.0, 2.0, 4.0]);
+        assert_eq!(out, [3.0, 3.0]);
+
+        // decay: gate = ln(0.5) -> expf = 0.5 escala TODO el estado primero;
+        // con el estado ya final del paso anterior:
+        // S' = 0.5*[[3,3],[2,4]]; d = v - dot(S'[:,j], k); el update y la salida
+        // siguen la misma cadena f32.
+        let prev = state;
+        let mut state2 = prev;
+        let mut out2 = [0.0f32; 2];
+        let g = 0.5f32.ln(); // expf(g) = 0.5 exacto en f32? ln(0.5) no es exacto -> tolerancia
+        gdn_fused_step(&mut state2, &mut out2, &[1.0, 0.0], &[1.0, 1.0], &[3.0, 4.0], g, 1.0, 1.0);
+        let half = 0.5f32;
+        // replicación manual en f32 (mismo orden documentado)
+        let mut rep = prev;
+        let g_exp = g.exp();
+        for s in rep.iter_mut() {
+            *s *= g_exp;
+        }
+        let d0 = (3.0f32 - (rep[0] + rep[2]) * 1.0) * 1.0;
+        let d1 = (4.0f32 - (rep[1] + rep[3]) * 1.0) * 1.0;
+        rep[0] = d0.mul_add(1.0, rep[0]);
+        rep[2] = d0.mul_add(1.0, rep[2]);
+        rep[1] = d1.mul_add(1.0, rep[1]);
+        rep[3] = d1.mul_add(1.0, rep[3]);
+        let o0 = (rep[0] * 1.0 + rep[2] * 0.0) * 1.0;
+        let o1 = (rep[1] * 1.0 + rep[3] * 0.0) * 1.0;
+        assert!((state2[0] - rep[0]).abs() < 1e-6 && (out2[0] - o0).abs() < 1e-6);
+        assert!((out2[1] - o1).abs() < 1e-6);
+        _ = half;
+    }
+
+    #[test]
+    fn gdn_fused_step_scale_is_on_output_not_q() {
+        // scale=2: out = dot(S,q)*2. Si la escala fuera sobre q, el dot usaría 2q.
+        // Estado final del test anterior es asimétrico: [[3,3],[2,4]] -> dot(S[:,0],q)
+        // con q=[2,0] es 6; con q=[1,0] y scale=2 también es 6 — usar q=[1,1]:
+        // dot(S[:,0],[1,1]) = 5, dot(S[:,1],[1,1]) = 7. Con scale=2 -> [10,14].
+        let mut state = [3.0f32, 3.0, 2.0, 4.0];
+        let mut out = [0.0f32; 2];
+        gdn_fused_step(&mut state, &mut out, &[1.0, 1.0], &[1.0, 1.0], &[3.0, 4.0], 0.0, 1.0, 2.0);
+        // d = v - dot(S,q... k): dot(S[:,0],k)=5, dot(S[:,1],k)=7 -> d=[-2,-3]
+        // S += d⊗k: S[0][0]-=2 ... S = [[1,0],[0,1]]; out = dot*scale = [1,1]*2 = [2,2]
+        assert_eq!(state, [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(out, [2.0, 2.0]);
+    }
+
+    #[test]
+    fn gdn_fused_step_replicates_documented_f32_chain() {
+        // Valores arbitrarios fijos (dim=3), sin decaimiento exacto: gate=0.
+        let q = [0.25f32, -0.5, 0.75];
+        let k = [-0.125f32, 0.5, 0.375];
+        let v = [1.0f32, -2.0, 0.5];
+        let beta = 0.8f32;
+        let scale = 0.0625f32; // 1/sqrt(256) real
+        let mut state = vec![0.0f32; 9];
+        for i in 0..3 {
+            state[i * 3 + i] = 1.0;
+        }
+        let mut out = [0.0f32; 3];
+        let mut rep_state = state.clone();
+        let mut rep_out = [0.0f32; 3];
+        gdn_fused_step(&mut state, &mut out, &q, &k, &v, 0.0, beta, scale);
+        // replicación independiente del MISMO orden documentado (productos f32
+        // → f64 secuencial → f32; mad sin FMA)
+        for j in 0..3 {
+            let mut sum: f64 = 0.0;
+            for i in 0..3 {
+                sum += (rep_state[i * 3 + j] * k[i]) as f64;
+            }
+            let d = (v[j] - sum as f32) * beta;
+            for i in 0..3 {
+                rep_state[i * 3 + j] += k[i] * d;
+            }
+        }
+        for j in 0..3 {
+            let mut sum: f64 = 0.0;
+            for i in 0..3 {
+                sum += (rep_state[i * 3 + j] * q[i]) as f64;
+            }
+            rep_out[j] = sum as f32 * scale;
+        }
+        // bit a bit: la réplica sigue exactamente el mismo orden f32
+        assert_eq!(state, rep_state);
+        assert_eq!(out, rep_out);
     }
 }
