@@ -117,25 +117,9 @@ impl Drop for AlignedBuf {
 // El buffer no comparte nada; moverlo entre hilos es seguro.
 unsafe impl Send for AlignedBuf {}
 
-// ---------------------------------------------------------------------------
-// Kernels: por ahora solo las firmas del backend scalar de referencia.
-// Cada kernel documenta su orden de reducción ANTES de tener cuerpo.
-// ---------------------------------------------------------------------------
+pub mod kernels;
 
-/// RMSNorm: `out = x / sqrt(mean(x^2) + eps) * w`, acumulador f64, eps DENTRO de la raíz.
-/// Orden de reducción: pares consecutivos `((a0+a1)+(a2+a3))...` en f64.
-pub fn rmsnorm(_out: &mut [f32], _x: &[f32], _w: &[f32], _eps: f64) {
-    todo!("Stage 0, ver docs/ROADMAP.md");
-}
-
-/// MatMul f32×f32 acumulando en f64, salida `acc += a @ b` (b en row-major [k, n]).
-/// Partición de reducción: 16 acumuladores f64 como en `k3_matmul`.
-pub fn matmul_f32_acc(_acc: &mut [f32], _a: &[f32], _b: &[f32], _m: usize, _k: usize, _n: usize) {
-    todo!("Stage 0, ver docs/ROADMAP.md");
-}
-
-/// RoPE intercalado estilo Llama (pares (2i, 2i+1)); variante NeoX en otro kernel.
-/// Frecuencias precalculadas en f32; la multiplicación compleja usa `mul_add` explícito.
-pub fn rope_apply_llama(_x: &mut [f32], _freqs: &[f32], _pos: usize) {
-    todo!("Stage 0, ver docs/ROADMAP.md");
-}
+pub use kernels::{
+    embedding_lookup, gelu_tanh, matmul_f32_acc, rmsnorm, rope_apply_llama, rope_apply_neox,
+    softmax, swiglu,
+};
