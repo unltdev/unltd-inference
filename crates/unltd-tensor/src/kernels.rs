@@ -18,7 +18,7 @@
 ///
 /// Esta función ES el orden de reducción del contrato: cada kernel que suma en
 /// f64 lo hace a través de ella (o replica el árbol en su test para fijarlo).
-fn pairwise_sum_f64(vals: &[f64]) -> f64 {
+pub(crate) fn pairwise_sum_f64(vals: &[f64]) -> f64 {
     let mut level = vals.to_vec();
     while level.len() > 1 {
         let mut next = Vec::with_capacity(level.len().div_ceil(2));

@@ -118,8 +118,10 @@ impl Drop for AlignedBuf {
 unsafe impl Send for AlignedBuf {}
 
 pub mod kernels;
+pub mod quants;
 
 pub use kernels::{
     embedding_lookup, gelu_tanh, matmul_f32_acc, rmsnorm, rope_apply_llama, rope_apply_neox,
     softmax, swiglu,
 };
+pub use quants::{dot_f32, dot_q4_k, dot_q6_k, f16_to_f32};
