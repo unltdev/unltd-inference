@@ -1,0 +1,5 @@
+/target
+Cargo.lock.orig
+*.tmp
+# Logs de sesiones de desarrollo (crash/API tests), no son artefactos del proyecto
+*.log

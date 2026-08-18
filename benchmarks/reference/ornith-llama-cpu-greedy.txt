@@ -1,0 +1,39 @@
+=== llama-cli --version ===
+version: 1 (9fcaed7)
+built with MSVC 19.44.35228.0 for Windows AMD64
+=== run: ornith Q4_K_M, CPU (-ngl 0), greedy, temp 0, raw (--no-conversation --simple-io --no-warmup) ===
+--no-conversation is not supported by llama-cli
+please use llama-completion instead
+
+Loading model... 
+
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b1-9fcaed7
+model      : ornith-1.0-9b-Q4_K_M.gguf
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+> The capital of France is
+
+[Start thinking]
+Thinking Process:
+
+1.  **Analyze the Request:** The user is asking a simple factual
+
+[ Prompt: 15.7 t/s | Generation: 5.0 t/s ]
+

@@ -1,0 +1,12 @@
+[package]
+name = "unltd-tokenizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BPE byte-level desde tokenizer.json y tiktoken.model"
+
+[dependencies]
+unltd-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

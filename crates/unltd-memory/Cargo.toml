@@ -1,0 +1,12 @@
+[package]
+name = "unltd-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MemoryManager, politicas de residencia, DiskReader y cache de expertos con trace"
+
+[dependencies]
+unltd-core.workspace = true
+unltd-tensor.workspace = true
+memmap2.workspace = true
+rayon.workspace = true

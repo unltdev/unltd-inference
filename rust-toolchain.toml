@@ -1,0 +1,4 @@
+# El motor no usa nightly: intrinsics estables de core::arch detrás de #[cfg]
+# (ver docs/ARCHITECTURE.md §2, decisión sobre portable_simd).
+[toolchain]
+channel = "stable"

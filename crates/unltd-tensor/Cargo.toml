@@ -1,0 +1,10 @@
+[package]
+name = "unltd-tensor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dtypes, vistas de tensores, buffers alineados y kernels (scalar de referencia + AVX2) con contrato numerico bit a bit"
+
+[dependencies]
+half.workspace = true
+bytemuck.workspace = true

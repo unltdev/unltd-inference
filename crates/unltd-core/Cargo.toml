@@ -1,0 +1,11 @@
+[package]
+name = "unltd-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Config estricta del modelo, errores/refusals y scratch sizing"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

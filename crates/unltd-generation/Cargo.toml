@@ -1,0 +1,15 @@
+[package]
+name = "unltd-generation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Forward pass, KV cache, decode loop y sampler"
+
+[dependencies]
+unltd-core.workspace = true
+unltd-tensor.workspace = true
+unltd-architectures.workspace = true
+unltd-memory.workspace = true
+unltd-tokenizer.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

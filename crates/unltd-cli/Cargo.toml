@@ -1,0 +1,21 @@
+[package]
+name = "unltd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Binario unltd: carga, presupuestos y generacion"
+
+[[bin]]
+name = "unltd"
+path = "src/main.rs"
+
+[dependencies]
+unltd-core.workspace = true
+unltd-tensor.workspace = true
+unltd-model-loader.workspace = true
+unltd-architectures.workspace = true
+unltd-memory.workspace = true
+unltd-tokenizer.workspace = true
+unltd-generation.workspace = true
+clap.workspace = true
+anyhow.workspace = true
