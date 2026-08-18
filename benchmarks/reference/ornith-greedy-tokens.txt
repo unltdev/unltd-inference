@@ -1,0 +1,46 @@
+=== ORÁCULO TOKEN-LEVEL: ornith-1.0-9b-Q4_K_M.gguf, greedy (temp 0), RAW (sin chat template) ===
+=== Fuente: llama-server (Prism b1-9fcaed7) /completion con logprobs:1, n_predict 20, -ngl 0 ===
+=== Fecha: 2026-08-18. JSON crudo en ornith-llama-server-completion.json ===
+=== stop_type: limit (20/20 tokens, sin EOS en este tramo). prompt_n=5, predicted_n=20 ===
+
+PROMPT TOKENS (5):
+    760  'The'
+   6511  ' capital'
+    314  ' of'
+   9338  ' France'
+    369  ' is'
+
+GENERATED TOKENS (20) — id, logprob (ln softmax, top-1), texto:
+  11751  -0.603409  ' Paris'
+     13  -0.306977  '.'
+    198  -1.804188  '\n'
+    760  -1.729520  'The'
+   6511  -1.087935  ' capital'
+    314  -0.034494  ' of'
+   9338  -0.480990  ' France'
+    369  -0.025731  ' is'
+  11751  -0.555780  ' Paris'
+     13  -0.111098  '.'
+    198  -0.460790  '\n'
+    760  -0.964508  'The'
+   6511  -0.064802  ' capital'
+    314  -0.002054  ' of'
+   9338  -0.011861  ' France'
+    369  -0.002488  ' is'
+  11751  -0.042800  ' Paris'
+     13  -0.007115  '.'
+    198  -0.214487  '\n'
+    760  -0.277949  'The'
+
+SECUENCIA DE IDs (para comparación programática):
+prompt:   [760, 6511, 314, 9338, 369]
+generado: [11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, 760]
+
+NOTAS:
+- Modo raw (-no-cnv): NO se aplica chat template y NO se añade BOS.
+- El modelo en raw completion repite "The capital of France is Paris." (artefacto del prompt
+  sin template: el modelo continúa el texto). Es determinista y sirve como gate.
+- El gate de Fase 5+: argmax en cada paso == estos IDs; además el logprob del top-1 debe
+  coincidir dentro de tolerancia numérica (comparación de logits reales, no solo tokens).
+- Con chat template el modelo emite <think> (thinking mode) — ver ornith-llama-chat-partial.txt.
+- Referencia de rendimiento CPU i7-8700 (6t): decode 3.3-4.6 t/s, prompt 4-7 t/s.
