@@ -2,7 +2,9 @@
 //! - `inspect` (Fase 2): header, metadata y tabla de tensores de un GGUF;
 //! - `min-forward` (Fase 5): embedding + attn_norm + cabeza de salida, validado
 //!   contra los bins del oráculo llama-eval-callback;
-//! - `tokenize` / `run` (Fase 6): stubs explícitos, no silenciosos.
+//! - `forward-oracle` (Fase 6): prefill de 5 tokens por 32 capas contra el oráculo;
+//! - `tokenize` (Fase 7): tokenizador real del GGUF (BPE byte-level gpt2);
+//! - `run` (Fase 8): generación greedy multi-token.
 //!
 //! Contratos de la CLI (heredados de k3_run.c, ver docs/AUDIT.md):
 //! - el banner de memoria es un PLAN que se imprime ANTES de asignar; el PEAK RSS se
@@ -17,8 +19,9 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use unltd_core::{human, LoadError};
-use unltd_generation::{LayerDump, MinForward, NodeCapture, Qwen35Forward};
+use unltd_generation::{GreedyLoop, LayerDump, MinForward, NodeCapture, Qwen35Forward};
 use unltd_model_loader::{GgufReader, MappedWeights};
+use unltd_tokenizer::{Gpt2Tokenizer, TokenError, Tokenizer};
 
 #[derive(Parser, Debug)]
 #[command(name = "unltd", version, about = "Disk-first CPU inference runtime")]
@@ -83,7 +86,7 @@ enum Cmd {
         debug_nodes: Option<PathBuf>,
     },
 
-    /// Tokeniza texto con el tokenizador del modelo (Fase 6).
+    /// Tokeniza texto con el tokenizador del modelo (Fase 7).
     Tokenize {
         /// Modelo: archivo .gguf.
         model: PathBuf,
@@ -92,7 +95,7 @@ enum Cmd {
         text: String,
     },
 
-    /// Genera texto con el motor (Fase 5).
+    /// Genera texto con el motor (Fase 8): greedy determinista, temperatura 0.
     Run {
         /// Modelo: archivo .gguf.
         model: PathBuf,
@@ -104,13 +107,9 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         max_tokens: u32,
 
-        /// Temperatura (0 = greedy determinista, el default).
+        /// Temperatura: solo 0 (greedy determinista) — sampling llega después.
         #[arg(long, default_value_t = 0.0)]
         temperature: f64,
-
-        /// Presupuesto total del motor (GB). `auto` lo dimensiona de la RAM disponible.
-        #[arg(long, default_value = "auto")]
-        budget: String,
     },
 }
 
@@ -137,13 +136,17 @@ fn main() {
                 std::process::exit(1);
             }
         }
-        Cmd::Tokenize { .. } | Cmd::Run { .. } => {
-            eprintln!(
-                "unltd: este comando llega en la Fase 7 (ver docs/ROADMAP.md). \
-                 Hoy existen `inspect` (Fase 2), `min-forward` (Fase 5) y \
-                 `forward-oracle` (Fase 6)."
-            );
-            std::process::exit(2);
+        Cmd::Tokenize { model, text } => {
+            if let Err(e) = cmd_tokenize(&model, &text) {
+                eprintln!("unltd tokenize: {e}");
+                std::process::exit(1);
+            }
+        }
+        Cmd::Run { model, prompt, max_tokens, temperature } => {
+            if let Err(e) = cmd_run(&model, &prompt, max_tokens, temperature) {
+                eprintln!("unltd run: {e}");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -233,9 +236,235 @@ fn cmd_inspect(gguf: &Path, no_tensors: bool) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Tokeniza texto con el tokenizador del GGUF (Fase 7). Imprime Token IDs /
+/// Pieces / texto decodificado. La puerta de la fase es que los IDs coincidan
+/// con los del oráculo llama.cpp para el mismo texto.
+fn cmd_tokenize(model: &Path, text: &str) -> Result<(), LoadError> {
+    let reader = GgufReader::open(model)?;
+    let tok = Gpt2Tokenizer::from_gguf(&reader)?;
+
+    println!("modelo  : {}", model.display());
+    println!("tokenizer: {} (pre: {})", tok.kind(), tok.pre());
+    println!("vocab   : {}", tok.vocab_size());
+    match (tok.bos(), tok.eos()) {
+        (Some(b), Some(e)) => println!("bos/eos : {b} / {e}"),
+        (None, Some(e)) => println!("bos/eos : (ninguno) / {e}"),
+        (Some(b), None) => println!("bos/eos : {b} / (ninguno)"),
+        (None, None) => println!("bos/eos : (ninguno) / (ninguno)"),
+    }
+    println!("text    : {text:?}");
+
+    let mut ids = Vec::new();
+    tok.encode(text, &mut ids).map_err(|e| match e {
+        TokenError::PieceMissing(p) => {
+            LoadError::corrupt(format!("encode: pieza {p:?} fuera del vocab (fallback por char incluido)"))
+        }
+        other => LoadError::corrupt(format!("encode: {other}")),
+    })?;
+
+    println!();
+    println!("tokens ({}):", ids.len());
+    for (i, &id) in ids.iter().enumerate() {
+        let piece = tok.piece(id).unwrap_or("<fuera de rango>");
+        let mut dec = Vec::new();
+        tok.decode(&[id], &mut dec).map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
+        println!("  [{i:>3}] id {id:<7} piece {piece:?} decoded {dec:?}");
+    }
+    let mut decoded = Vec::new();
+    tok.decode(&ids, &mut decoded).map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
+    println!();
+    println!("ids     : {ids:?}");
+    println!("decoded : {:?}", String::from_utf8_lossy(&decoded));
+    Ok(())
+}
+
 /// Tokens del prompt con el que se generó el oráculo de ornith
 /// ("The capital of France is", raw, add_bos=false).
 const ORACLE_PROMPT_TOKENS: [u32; 5] = [760, 6511, 314, 9338, 369];
+
+/// Tokens generados por el oráculo para ese prompt (llama-server Prism,
+/// greedy temp 0, raw -no-cnv, n_predict 20, -ngl 0). Fuente única de verdad:
+/// `benchmarks/reference/ornith-greedy-tokens.txt` (stop_type: limit, sin EOS).
+const ORACLE_GENERATED_TOKENS: [u32; 20] = [
+    11751, 13, 198, 760, 6511, 314, 9338, 369, 11751, 13, 198, 760, 6511, 314, 9338, 369, 11751,
+    13, 198, 760,
+];
+
+/// Generación greedy multi-token (Fase 8): tokenize raw → prefill token a
+/// token → loop decode (norm → logits → argmax → append). Sin KV cache
+/// incremental adicional: la sesión YA es el KV cache incremental del motor
+/// (~14 s/token marginales, medido en Fase 6).
+///
+/// Puerta: los 20 tokens greedy coinciden con el oráculo (tabla
+/// `step | UNLTD | oracle | match`). Si divergen, se reporta el PRIMER token
+/// distinto y se sigue generando para completar la tabla (política de la
+/// directiva: aislar el primer mismatch, no detenerse a investigar acá).
+fn cmd_run(model: &Path, prompt: &str, max_tokens: u32, temperature: f64) -> Result<(), LoadError> {
+    if temperature != 0.0 || temperature.is_nan() {
+        return Err(LoadError::corrupt(format!(
+            "temperatura {temperature}: solo 0 (greedy determinista) está implementado (Fase 8)"
+        )));
+    }
+
+    let reader = GgufReader::open(model)?;
+    let tok = Gpt2Tokenizer::from_gguf(&reader)?;
+    let fwd = Qwen35Forward::open(MappedWeights::open(model)?)?;
+
+    // Tokenizado RAW (sin BOS): el mismo modo que el oráculo (-no-cnv, sin
+    // add_bos). ornith no declara bos_token_id, así que no hay política de BOS.
+    let mut prompt_ids = Vec::new();
+    tok.encode(prompt, &mut prompt_ids).map_err(|e| match e {
+        TokenError::PieceMissing(p) => {
+            LoadError::corrupt(format!("encode: pieza {p:?} fuera del vocab (fallback por char incluido)"))
+        }
+        other => LoadError::corrupt(format!("encode: {other}")),
+    })?;
+    if prompt_ids.is_empty() {
+        return Err(LoadError::corrupt("prompt vacío"));
+    }
+
+    let ctx = prompt_ids.len() + max_tokens as usize;
+    let mut session = fwd.new_session(ctx);
+
+    let mut gen = GreedyLoop::new(
+        |t, logits| {
+            let emb = fwd.embed(&[t])?;
+            let l_out = fwd.step(&mut session, &emb, None, None)?;
+            let rn = fwd.output_norm(&l_out)?;
+            *logits = fwd.output_logits(&rn)?;
+            Ok(())
+        },
+        tok.eos(),
+        max_tokens,
+    );
+
+    println!("modelo  : {}", model.display());
+    println!("arch    : qwen35 (Fase 8, greedy temperatura 0)");
+    println!("prompt  : {prompt:?}");
+    println!(
+        "tokens  : {prompt_ids:?} ({}, raw sin BOS)",
+        prompt_ids.len()
+    );
+    println!("eos     : {:?}", tok.eos());
+    println!("max     : {max_tokens}");
+    println!(
+        "ctx     : {ctx} (prompt + max_tokens, KV cache pre-dimensionado)"
+    );
+
+    // RAM aproximada (analítica, sin API de proceso): el archivo se mapea y
+    // se pagina por demanda; el KV cache es el único término que crece con ctx.
+    let mut kv_bytes = 0u64;
+    for il in 0..fwd.cfg.n_layer {
+        if fwd.cfg.is_full_attn(il) {
+            kv_bytes +=
+                (ctx * fwd.cfg.n_head_kv * fwd.cfg.head_dim_v * 2 * 4) as u64;
+        }
+    }
+    println!(
+        "ram     : {} modelo (mmap, paginado) + {} KV cache + activaciones O(n_embd={})",
+        human(reader.file_size),
+        human(kv_bytes),
+        fwd.cfg.n_embd
+    );
+
+    let t0 = std::time::Instant::now();
+    gen.prefill(&prompt_ids)?;
+    let t_prefill = t0.elapsed();
+    println!(
+        "prefill : {} tokens en {:.1}s ({:.2} s/token)",
+        prompt_ids.len(),
+        t_prefill.as_secs_f64(),
+        t_prefill.as_secs_f64() / prompt_ids.len() as f64
+    );
+
+    println!();
+    println!("step | UNLTD                            | oracle | match");
+    let mut generated: Vec<u32> = Vec::new();
+    let mut n_match = 0usize;
+    let mut first_mismatch: Option<(usize, u32, u32)> = None;
+    // Los logits del último token del prefill deciden el argmax del paso 0.
+    let mut decision_logits: Vec<f32> = gen.logits().to_vec();
+    let t1 = std::time::Instant::now();
+    while let Some(t) = gen.next_token()? {
+        let step = generated.len();
+        generated.push(t);
+        let oracle = ORACLE_GENERATED_TOKENS.get(step).copied();
+        let piece = tok.piece(t).unwrap_or("<oob>");
+        let ok = oracle == Some(t);
+        if ok {
+            n_match += 1;
+        } else if first_mismatch.is_none() {
+            first_mismatch = Some((step, t, oracle.unwrap_or(u32::MAX)));
+            // Los logits que DECIDIERON este argmax (snapshot antes del
+            // forward del token): miden si el token del oráculo estaba cerca
+            // (flip de argmax por divergencia numérica documentada) o lejos.
+            let (ti, top) = top5(&decision_logits);
+            println!("       top-5 decisión: [{ti}] {top:?}");
+            if let Some(o) = oracle {
+                match decision_logits.iter().enumerate().find(|(i, _)| *i == o as usize) {
+                    Some((_, &v)) => {
+                        let gap = decision_logits[ti] - v;
+                        println!("       oráculo {o} en logit {v:.6} (gap al argmax {gap:.6})");
+                    }
+                    None => println!("       oráculo {o} fuera del vocab"),
+                }
+            }
+        }
+        println!(
+            "{:>4} | {:<6} {:<24.24} | {:>6} | {}",
+            step,
+            t,
+            piece,
+            oracle.map(|o| o.to_string()).unwrap_or_else(|| "-".into()),
+            if ok { "MATCH" } else { "DIFF" }
+        );
+        // Snapshot para el próximo paso (los logits vigentes deciden el
+        // argmax de la PRÓXIMA iteración).
+        decision_logits = gen.logits().to_vec();
+    }
+    let t_gen = t1.elapsed();
+
+    // top-5 del último token (informativo: la puerta es el argmax, los valores
+    // difieren del oráculo dentro del contrato numérico de la Fase 6).
+    let (top_idx, top) = top5(gen.logits());
+    println!(
+        "top-5   : [{top_idx}] {top:?} (informativo, la puerta es el argmax)"
+    );
+
+    let mut decoded = Vec::new();
+    tok.decode(&generated, &mut decoded)
+        .map_err(|e| LoadError::corrupt(format!("decode: {e}")))?;
+    println!("decoded : {:?}", String::from_utf8_lossy(&decoded));
+    println!();
+    println!(
+        "matches : {n_match}/{max_tokens} contra el oráculo"
+    );
+    let n_forward = if generated.is_empty() { 0 } else { generated.len() - 1 };
+    let s_per_tok = if n_forward > 0 { t_gen.as_secs_f64() / n_forward as f64 } else { 0.0 };
+    println!(
+        "tiempos : prefill {:.1}s (TTFT ~= prefill, el token 1 sale del último logit del prefill); \
+         decode {:.1}s para {} forwards ({:.2} s/token); total {:.1}s",
+        t_prefill.as_secs_f64(),
+        t_gen.as_secs_f64(),
+        n_forward,
+        s_per_tok,
+        (t_prefill + t_gen).as_secs_f64(),
+    );
+
+    match first_mismatch {
+        None => {
+            println!("\nRUN PASS: {n_match}/{max_tokens} tokens greedy == oráculo.");
+            Ok(())
+        }
+        Some((step, mine, oracle)) => {
+            eprintln!(
+                "\nRUN INVALID — primer mismatch en el token generado {step}: \
+                 UNLTD {mine} vs oráculo {oracle}"
+            );
+            std::process::exit(3);
+        }
+    }
+}
 
 /// Tolerancia de attn_norm contra el oráculo: el motor reduce pairwise en f64
 /// y el oráculo secuencial en f32 (l2_norm de ggml); con |x| ~ O(1) la

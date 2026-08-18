@@ -42,6 +42,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 memmap2 = "0.9"
 rayon = "1"
+regex = "1"
 
 [profile.release]
 lto = "thin"

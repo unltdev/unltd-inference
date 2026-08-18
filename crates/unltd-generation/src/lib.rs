@@ -20,9 +20,11 @@
 //!   nunca un drop silencioso: tokens plausibles con parte del ruteo faltante son
 //!   corrupción numérica que parece una corrida buena.
 
+pub mod greedy;
 pub mod min_forward;
 pub mod qwen35_forward;
 
+pub use greedy::{argmax, GreedyLoop};
 pub use min_forward::MinForward;
 pub use qwen35_forward::{LayerDump, NodeCapture, Qwen35Forward, Qwen35Session};
 

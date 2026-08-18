@@ -3,10 +3,10 @@ name = "unltd-tokenizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "BPE byte-level desde tokenizer.json y tiktoken.model"
+description = "BPE byte-level (gpt2) desde el GGUF del modelo"
 
 [dependencies]
 unltd-core.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+unltd-model-loader.workspace = true
+regex.workspace = true
 thiserror.workspace = true
