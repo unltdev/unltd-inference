@@ -365,6 +365,7 @@ dependencies = [
  "serde",
  "serde_json",
  "unltd-core",
+ "unltd-model-loader",
  "unltd-tensor",
 ]
 
@@ -396,11 +397,13 @@ dependencies = [
 name = "unltd-generation"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "rayon",
  "thiserror",
  "unltd-architectures",
  "unltd-core",
  "unltd-memory",
+ "unltd-model-loader",
  "unltd-tensor",
  "unltd-tokenizer",
 ]
@@ -420,6 +423,7 @@ name = "unltd-model-loader"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "memmap2",
  "serde",
  "serde_json",
  "unltd-core",

@@ -10,11 +10,13 @@
 //! Un peso ausente leído como ceros produce un modelo que corre, fluido y equivocado.
 
 pub mod gguf;
+pub mod weights;
 
 pub use gguf::{
     ggml_type_blocksize, ggml_type_name, GgufArray, GgufReader, GgufValue, GgufValueType,
     GGUF_ALIGN,
 };
+pub use weights::MappedWeights;
 
 /// Metadata de un tensor indexado: dónde están sus bytes y con qué dtype.
 /// Tipo unificado para GGUF y safetensors.

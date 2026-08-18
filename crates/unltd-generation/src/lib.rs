@@ -20,6 +20,10 @@
 //!   nunca un drop silencioso: tokens plausibles con parte del ruteo faltante son
 //!   corrupción numérica que parece una corrida buena.
 
+pub mod min_forward;
+
+pub use min_forward::MinForward;
+
 use unltd_architectures::ModelSpec;
 use unltd_core::{LoadError, WeightId};
 use unltd_memory::{MemoryManager, ResidencyClass};

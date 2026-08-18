@@ -11,6 +11,10 @@
 
 use unltd_core::WeightId;
 
+pub mod qwen35;
+
+pub use qwen35::{Qwen35Config, ARCH as QWEN35_ARCH};
+
 /// Tipos de atención. La MLA tiene DOS semánticas en el ecosistema y la IR las distingue
 /// explícitamente en vez de fusionarlas falsamente:
 ///

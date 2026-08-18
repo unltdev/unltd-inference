@@ -1,6 +1,8 @@
 //! CLI de unltd. Subcomandos por fase del ROADMAP:
 //! - `inspect` (Fase 2): header, metadata y tabla de tensores de un GGUF;
-//! - `tokenize` / `run` (Fase 5): stubs explícitos, no silenciosos.
+//! - `min-forward` (Fase 5): embedding + attn_norm + cabeza de salida, validado
+//!   contra los bins del oráculo llama-eval-callback;
+//! - `tokenize` / `run` (Fase 6): stubs explícitos, no silenciosos.
 //!
 //! Contratos de la CLI (heredados de k3_run.c, ver docs/AUDIT.md):
 //! - el banner de memoria es un PLAN que se imprime ANTES de asignar; el PEAK RSS se
@@ -15,7 +17,8 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 use unltd_core::{human, LoadError};
-use unltd_model_loader::GgufReader;
+use unltd_generation::MinForward;
+use unltd_model_loader::{GgufReader, MappedWeights};
 
 #[derive(Parser, Debug)]
 #[command(name = "unltd", version, about = "Disk-first CPU inference runtime")]
@@ -36,7 +39,22 @@ enum Cmd {
         no_tensors: bool,
     },
 
-    /// Tokeniza texto con el tokenizador del modelo (Fase 5).
+    /// Forward mínimo Fase 5 contra el oráculo (embeddings, attn_norm, cabeza
+    /// de salida). Sin `--oracle-dir` solo ejercita el forward y reporta.
+    MinForward {
+        /// Modelo: archivo .gguf.
+        model: PathBuf,
+
+        /// Tokens (ids) a embeder, separados por coma.
+        #[arg(long)]
+        tokens: String,
+
+        /// Directorio con los bins del oráculo (ornith-*.f32.bin).
+        #[arg(long)]
+        oracle_dir: Option<PathBuf>,
+    },
+
+    /// Tokeniza texto con el tokenizador del modelo (Fase 6).
     Tokenize {
         /// Modelo: archivo .gguf.
         model: PathBuf,
@@ -76,10 +94,16 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Cmd::MinForward { model, tokens, oracle_dir } => {
+            if let Err(e) = cmd_min_forward(&model, &tokens, oracle_dir.as_deref()) {
+                eprintln!("unltd min-forward: {e}");
+                std::process::exit(1);
+            }
+        }
         Cmd::Tokenize { .. } | Cmd::Run { .. } => {
             eprintln!(
-                "unltd: este comando llega en la Fase 5 (ver docs/ROADMAP.md). \
-                 Hoy solo existe `inspect` (Fase 2)."
+                "unltd: este comando llega en la Fase 6 (ver docs/ROADMAP.md). \
+                 Hoy existen `inspect` (Fase 2) y `min-forward` (Fase 5)."
             );
             std::process::exit(2);
         }
@@ -169,4 +193,151 @@ fn cmd_inspect(gguf: &Path, no_tensors: bool) -> Result<(), LoadError> {
     }
 
     Ok(())
+}
+
+/// Tokens del prompt con el que se generó el oráculo de ornith
+/// ("The capital of France is", raw, add_bos=false).
+const ORACLE_PROMPT_TOKENS: [u32; 5] = [760, 6511, 314, 9338, 369];
+
+/// Tolerancia de attn_norm contra el oráculo: el motor reduce pairwise en f64
+/// y el oráculo secuencial en f32 (l2_norm de ggml); con |x| ~ O(1) la
+/// diferencia de orden + precisión cabe en 1e-5 (docs/AUDIT.md §3.3).
+const NORM_TOL: f32 = 1e-5;
+
+fn cmd_min_forward(model: &Path, tokens: &str, oracle_dir: Option<&Path>) -> Result<(), LoadError> {
+    let ids: Vec<u32> = tokens
+        .split(',')
+        .map(|s| {
+            s.trim()
+                .parse::<u32>()
+                .map_err(|e| LoadError::corrupt(format!("token inválido '{s}': {e}")))
+        })
+        .collect::<Result<_, _>>()?;
+    if ids.is_empty() {
+        return Err(LoadError::corrupt("--tokens vacío".to_string()));
+    }
+
+    let mf = MinForward::open(MappedWeights::open(model)?)?;
+    let n = mf.cfg.n_embd;
+    println!("modelo     : {}", model.display());
+    println!("arch       : qwen35 (Fase 5)");
+    println!("n_embd     : {n}");
+    println!("vocab      : {}", mf.vocab());
+    println!("tokens     : {ids:?}");
+
+    let emb = mf.embed(&ids)?;
+    let norm = mf.attn_norm_rows(&emb)?;
+    println!(
+        "embed      : {} filas x {n} (max |x| = {:.6})",
+        ids.len(),
+        max_abs(&emb)
+    );
+    println!(
+        "attn_norm  : {} filas x {n} (max |x| = {:.6})",
+        ids.len(),
+        max_abs(&norm)
+    );
+
+    if ids.as_slice() != ORACLE_PROMPT_TOKENS.as_slice() {
+        eprintln!(
+            "WARNING: los tokens no son el prompt del oráculo {ORACLE_PROMPT_TOKENS:?}; \
+             la comparación fila a fila fallará en la puerta de embeddings."
+        );
+    }
+
+    let Some(dir) = oracle_dir else {
+        println!("\n(sin --oracle-dir: forward ejercitado, sin comparación)");
+        return Ok(());
+    };
+
+    // 1) embeddings: bit-idénticos al oráculo (mismo dequantize Q4_K en f32).
+    // `!= 0.0` es deliberado: la puerta ES la igualdad bit a bit, no una cota.
+    let oracle_emb = read_f32_bin(&dir.join("ornith-model.input_embed.f32.bin"), emb.len())?;
+    let (e_max, e_at) = max_abs_diff(&emb, &oracle_emb);
+    println!("\npuerta embeddings (bit-exact):");
+    println!("  max |diff| = {e_max:.9} en [{e_at}]");
+    if e_max != 0.0 {
+        return fail("embeddings", &format!("max |diff| = {e_max:.9} (debe ser 0.0)"));
+    }
+    println!("  PASS: bit-idénticos al oráculo");
+
+    // 2) attn_norm: ≤ 1e-5 (pairwise-f64 vs secuencial-f32, documentado).
+    let oracle_norm = read_f32_bin(&dir.join("ornith-attn_norm-0.f32.bin"), norm.len())?;
+    let (n_max, n_at) = max_abs_diff(&norm, &oracle_norm);
+    println!("puerta attn_norm (tolerancia {NORM_TOL}):");
+    println!("  max |diff| = {n_max:.9} en [{n_at}]");
+    if n_max > NORM_TOL {
+        return fail("attn_norm", &format!("max |diff| = {n_max:.9} > {NORM_TOL}"));
+    }
+    println!("  PASS");
+
+    // 3) cabeza de salida: argmax == oráculo. La magnitud del diff refleja la
+    // cuantización Q8_K de activaciones del oráculo (documentada), no se gata.
+    let oracle_rn = read_f32_bin(&dir.join("ornith-result_norm.f32.bin"), n)?;
+    let logits = mf.output_logits(&oracle_rn)?;
+    let oracle_out = read_f32_bin(&dir.join("ornith-result_output.f32.bin"), mf.vocab())?;
+    let (mine_idx, mine_top) = top5(&logits);
+    let (ora_idx, ora_top) = top5(&oracle_out);
+    let (l_max, l_at) = max_abs_diff(&logits, &oracle_out);
+    println!("puerta logits (argmax == oráculo):");
+    println!("  max |diff| = {l_max:.9} en [{l_at}] (Q8_K de activaciones, informativo)");
+    println!("  argmax     : mine {mine_idx}, oráculo {ora_idx}");
+    println!("  top-5      : mine {mine_top:?}");
+    println!("               ora  {ora_top:?}");
+    if mine_idx != ora_idx {
+        return fail("logits", &format!("argmax {mine_idx} != oráculo {ora_idx}"));
+    }
+    println!("  PASS");
+
+    println!("\nMIN-FORWARD PASS: las tres puertas en verde.");
+    Ok(())
+}
+
+/// Fallo numérico de una puerta: exit 3 (distinto de errores de carga) +
+/// `RUN INVALID`, el contrato de la CLI para corridas no fiables.
+fn fail(gate: &str, detail: &str) -> Result<(), LoadError> {
+    eprintln!("\nMIN-FORWARD FAIL ({gate}): {detail}");
+    eprintln!("RUN INVALID — no continuar a Fase 6 con este estado.");
+    std::process::exit(3);
+}
+
+fn max_abs(v: &[f32]) -> f32 {
+    v.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
+    assert_eq!(a.len(), b.len());
+    let mut m = 0.0f32;
+    let mut at = 0;
+    for i in 0..a.len() {
+        let d = (a[i] - b[i]).abs();
+        if d > m {
+            m = d;
+            at = i;
+        }
+    }
+    (m, at)
+}
+
+fn top5(v: &[f32]) -> (usize, Vec<(usize, f32)>) {
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
+    (idx[0], idx.iter().take(5).map(|&i| (i, v[i])).collect())
+}
+
+fn read_f32_bin(path: &Path, expect: usize) -> Result<Vec<f32>, LoadError> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| LoadError::corrupt(format!("oráculo {}: {e}", path.display())))?;
+    if bytes.len() != expect * 4 {
+        return Err(LoadError::corrupt(format!(
+            "oráculo {}: {} bytes, se esperaban {}",
+            path.display(),
+            bytes.len(),
+            expect * 4
+        )));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
 }

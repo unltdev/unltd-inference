@@ -4,7 +4,9 @@
 //! gguf-py sobre bytes REALES de ornith-1.0-9b-Q4_K_M.gguf (ver `ornith_decode_pin`).
 //!
 //! Principio (ARCHITECTURE §3): los bloques se multiplican directamente desde
-//! sus bytes, NUNCA se desquantizan a una copia de pesos.
+//! sus bytes, NUNCA se desquantizan a una copia de pesos — salvo el lookup de
+//! embeddings ([`dequantize_q4_k`]): GET_ROWS es por definición una copia, y el
+//! oráculo materializa exactamente eso (dequantize_row_q4_K).
 //!
 //! Contrato numérico por elemento (AUDIT §3.3, igual que los kernels f32):
 //! 1. el peso cuantizado se reconstruye en f64 y es EXACTO — cada fórmula de
@@ -186,6 +188,97 @@ pub fn dot_q6_k(x: &[f32], w: &[u8]) -> f64 {
     pairwise_sum_f64(&prods)
 }
 
+/// GEMV sobre una matriz de pesos empaquetados: `out[j] = Σ_i x[i] * w[i, j]`.
+/// La matriz `w` es `[dim_in, dim_out]` con filas de `dim_in` contiguas (como las
+/// escribe GGUF); cada fila es un vector de bloques del dtype.
+///
+/// Contrato: el dot de cada fila sigue su kernel (F32/Q4_K/Q6_K — mismo árbol
+/// pairwise, mismas cotas de exactitud); las filas son independientes y el
+/// llamador puede paralelizar por rangos de `out` (contrato §5). El dtype del
+/// archivo se toma de [`crate::DType`], NUNCA se adivina desde los bytes.
+pub fn gemv_quant(out: &mut [f32], x: &[f32], w: &[u8], dim_in: usize, dim_out: usize, dtype: crate::DType) {
+    assert_eq!(out.len(), dim_out, "gemv_quant: len(out) != dim_out");
+    assert!(x.len() >= dim_in, "gemv_quant: len(x) < dim_in");
+    let row_bytes = match dtype {
+        crate::DType::F32 => dim_in * 4,
+        crate::DType::Q4K | crate::DType::Q6K => {
+            assert_eq!(dim_in % QK_K, 0, "gemv_quant: dim_in no es múltiplo de {QK_K}");
+            dim_in / QK_K
+                * match dtype {
+                    crate::DType::Q4K => BLOCK_Q4_K_BYTES,
+                    _ => BLOCK_Q6_K_BYTES,
+                }
+        }
+        other => panic!("gemv_quant: dtype {other:?} sin dot implementado"),
+    };
+    assert_eq!(w.len(), row_bytes * dim_out, "gemv_quant: len(w) != filas exactas");
+    let x = &x[..dim_in];
+    for j in 0..dim_out {
+        let row = &w[j * row_bytes..(j + 1) * row_bytes];
+        let sum = match dtype {
+            crate::DType::F32 => {
+                let row: &[f32] = bytemuck::cast_slice(row);
+                dot_f32(x, row)
+            }
+            crate::DType::Q4K => dot_q4_k(x, row),
+            _ => dot_q6_k(x, row),
+        };
+        out[j] = sum as f32;
+    }
+}
+
+/// Dequantiza una fila Q4_K a f32 con la fórmula EXACTA de la referencia
+/// (`dequantize_row_q4_K`, ggml-quants.c:1471 — la usa GET_ROWS para los
+/// embeddings cuantizados, que es el ÚNICO camino que materializa pesos a f32;
+/// los dots nunca dequantizan, ver doc del módulo):
+///
+/// ```text
+/// por bloque: d = f16→f32(d), min = f16→f32(dmin)
+/// por par de grupos (is = 0, 2, 4, 6):
+///   d1 = d * sc(is);   m1 = min * m(is)      (f32)
+///   d2 = d * sc(is+1); m2 = min * m(is+1)    (f32)
+///   y[32·(is)]   = d1 * (q[l] & 0xF) - m1    (f32, l = 0..32)
+///   y[32·(is+1)] = d2 * (q[l] >> 4)  - m2    (f32, l = 0..32)
+/// ```
+///
+/// Bit-idéntico al oráculo: mismas operaciones f32 en el mismo orden (los u8 se
+/// ensanchan a f32 exactamente). NOTA: el nibble NO lleva shift -16 — el offset
+/// vive en `min` (misma convención que [`dot_q4_k`]).
+pub fn dequantize_q4_k(out: &mut [f32], w: &[u8]) {
+    assert_eq!(
+        w.len(),
+        out.len() / QK_K * BLOCK_Q4_K_BYTES,
+        "dequantize_q4_k: len(w) != bloques exactos para len(out)"
+    );
+    let mut e = 0usize;
+    for block in w.chunks_exact(BLOCK_Q4_K_BYTES) {
+        let d = f16_to_f32(f16_at(&block[0..2]));
+        let min = f16_to_f32(f16_at(&block[2..4]));
+        let scales = &block[4..16];
+        let mut qs = &block[16..];
+        let mut is = 0usize;
+        while is < 8 {
+            let (sc0, m0) = scale_min_k4(scales, is);
+            let d1 = d * sc0 as f32;
+            let m1 = min * m0 as f32;
+            let (sc1, m1s) = scale_min_k4(scales, is + 1);
+            let d2 = d * sc1 as f32;
+            let m2 = min * m1s as f32;
+            for l in 0..32 {
+                out[e] = d1 * (qs[l] & 0xF) as f32 - m1;
+                e += 1;
+            }
+            for l in 0..32 {
+                out[e] = d2 * (qs[l] >> 4) as f32 - m2;
+                e += 1;
+            }
+            qs = &qs[32..];
+            is += 2;
+        }
+    }
+    assert_eq!(e, out.len());
+}
+
 // ---------------------------------------------------------------------------
 // Tests: casos a mano (valores exactos), pines de orden del árbol, y el pin
 // de bytes reales de ornith contra gguf-py (generado por
@@ -221,6 +314,84 @@ mod tests {
         assert_eq!(dot_f32(&[1.0, 2.0, 3.0, 4.0], &[5.0, 6.0, 7.0, 8.0]), 70.0);
         // cola impar n=3: (p0+p1)+p2
         assert_eq!(dot_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]), 32.0);
+    }
+
+    #[test]
+    fn dequantize_q4_k_hand_values_and_multi_block() {
+        // bloque A: d=1, dmin=2; g0: sc=1 (scales[0]&63) / m=3 (scales[4]&63);
+        // g1: sc=2 / m=1; g2..7: 0. qs[0] = 0x12: nib bajo 2 (elem 0, g0),
+        // nib alto 1 (elem 32, g1).
+        let mut scales = [0u8; 12];
+        scales[0] = 1;
+        scales[4] = 3;
+        scales[1] = 2;
+        scales[5] = 1;
+        let mut qs = [0u8; 128];
+        qs[0] = 0x12;
+        let block_a = q4_block(F16_ONE, F16_TWO, scales, qs);
+        // bloque B: d = 0 → todos los valores 0 (prueba el offset del 2º bloque)
+        let block_b = q4_block(0x0000, 0x0000, [0; 12], [0xAB; 128]);
+        let mut w = block_a.clone();
+        w.extend_from_slice(&block_b);
+
+        let mut out = vec![0.0f32; 512];
+        dequantize_q4_k(&mut out, &w);
+
+        assert_eq!(out[0], -4.0); // 1·(0x12 & 0xF) − 2·3 = 2 − 6
+        assert_eq!(out[1], -6.0); // nib 0: 0 − 6
+        assert_eq!(out[31], -6.0);
+        assert_eq!(out[32], 0.0); // 2·(0x12 >> 4) − 2·1 = 2 − 2
+        assert_eq!(out[33], -2.0); // nib 0: 0 − 2
+        for i in 64..256 {
+            assert_eq!(out[i], 0.0, "elem {i} (grupos 2..7)");
+        }
+        for i in 256..512 {
+            assert_eq!(out[i], 0.0, "elem {i} (bloque B)");
+        }
+
+        // consistencia con el dot: dot_q4_k reconstruye en f64 exacto, la
+        // dequantizada está redondeada a f32 — mismas fórmulas, ≤ 1 ulp/elem
+        let x = [0.5f32; 256];
+        let exact = dot_q4_k(&x, &block_a);
+        let via_deq = dot_f32(&x, &out[..256]);
+        assert!(
+            (via_deq - exact).abs() < 1e-4,
+            "dot exacto {exact} vs via dequantize {via_deq}"
+        );
+    }
+
+    #[test]
+    fn dequantize_q4_k_matches_reference_formula_bitwise() {
+        // Bytes arbitrarios (scales con bits altos para grupos 4..7) + réplica
+        // independiente en f32 de dequantize_row_q4_K (ggml-quants.c:1471).
+        let scales: [u8; 12] = [0x1F, 0x2E, 0x3D, 0x4C, 0x5B, 0x6A, 0x79, 0x03, 0x92, 0x81, 0x70, 0x6F];
+        let qs: [u8; 128] = core::array::from_fn(|i| (i * 7 + 3) as u8);
+        let d_bits = 0x3B21u16;
+        let dmin_bits = 0x2C10u16;
+        let block = q4_block(d_bits, dmin_bits, scales, qs);
+
+        let mut out = vec![0.0f32; 256];
+        dequantize_q4_k(&mut out, &block);
+
+        let d = f16_to_f32(d_bits);
+        let min = f16_to_f32(dmin_bits);
+        let mut e = 0usize;
+        let mut is = 0usize;
+        while is < 8 {
+            // el kernel avanza 32 bytes de qs por par de grupos (is += 2)
+            let qs_pair = &qs[32 * (is / 2)..32 * (is / 2) + 32];
+            for (g, shift) in [(is, 0u32), (is + 1, 4u32)] {
+                let (sc, m) = scale_min_k4(&scales, g);
+                let dg = d * sc as f32;
+                let mg = min * m as f32;
+                for l in 0..32 {
+                    let expected = dg * ((qs_pair[l] >> shift) & 0xF) as f32 - mg;
+                    assert_eq!(out[e].to_bits(), expected.to_bits(), "elem {e}");
+                    e += 1;
+                }
+            }
+            is += 2;
+        }
     }
 
     fn q4_block(d: u16, dmin: u16, scales: [u8; 12], qs: [u8; 128]) -> Vec<u8> {

@@ -30,6 +30,11 @@ pub enum LoadError {
     #[error("tensor '{name}' has {got} elements, expected {want}")]
     ElementCount { name: String, got: usize, want: usize },
 
+    /// Tensor requerido que no está en el índice del archivo. Distinto de un
+    /// archivo corrupto: el archivo es válido, le falta un peso.
+    #[error("tensor '{name}' not found in the file index")]
+    MissingTensor { name: String },
+
     /// El plan de memoria no cabe. `need` y `have` siempre se imprimen juntos.
     #[error("this run needs {need}, the machine has {have} available")]
     DoesNotFit { need: String, have: String },

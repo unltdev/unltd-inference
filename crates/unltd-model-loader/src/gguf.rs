@@ -757,7 +757,7 @@ fn rd_array<R: Read + Seek>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
 
@@ -805,7 +805,7 @@ mod tests {
     /// contiguos, sin padding; las infos terminan en 217 → data_start = 224.
     /// Offsets relativos: t0 @0 (abs 224, 48 B de F32), t1 @64 (abs 288, 68 B de
     /// Q8_0); el archivo se rellena hasta 356.
-    fn fixture_valid() -> Vec<u8> {
+    pub(crate) fn fixture_valid() -> Vec<u8> {
         let header = W::new()
             .raw(b"GGUF")
             .u32(3) // version

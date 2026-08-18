@@ -8,5 +8,6 @@ description = "Adapters de arquitectura (llama, qwen2/3, mixtral, deepseek-mla) 
 [dependencies]
 unltd-core.workspace = true
 unltd-tensor.workspace = true
+unltd-model-loader.workspace = true
 serde.workspace = true
 serde_json.workspace = true

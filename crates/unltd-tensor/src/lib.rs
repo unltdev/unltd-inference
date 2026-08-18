@@ -121,7 +121,7 @@ pub mod kernels;
 pub mod quants;
 
 pub use kernels::{
-    embedding_lookup, gelu_tanh, matmul_f32_acc, rmsnorm, rope_apply_llama, rope_apply_neox,
-    softmax, swiglu,
+    embedding_lookup, gelu_tanh, l2_norm_rows, matmul_f32_acc, rmsnorm, rope_apply_imrope,
+    rope_apply_llama, rope_apply_neox, sigmoid, silu, softmax, softplus, ssm_conv, swiglu,
 };
-pub use quants::{dot_f32, dot_q4_k, dot_q6_k, f16_to_f32};
+pub use quants::{dequantize_q4_k, dot_f32, dot_q4_k, dot_q6_k, f16_to_f32, gemv_quant};
