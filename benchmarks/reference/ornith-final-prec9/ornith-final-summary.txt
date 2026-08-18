@@ -1,0 +1,12 @@
+model.input_embed: n=20480 sum=0.329444347 -> ornith-model.input_embed.f32.bin
+attn_norm-0: n=20480 sum=39.042967333 -> ornith-attn_norm-0.f32.bin
+norm: n=20480 sum=-7.505680479 -> ornith-norm.f32.bin
+result_norm: n=4096 sum=-47.653797124 -> ornith-result_norm.f32.bin
+result_output: n=248320 sum=-500892.139242799 -> ornith-result_output.f32.bin
+result_output top-5 (idx, valor):
+  #1 idx=11751 v=16.352005000
+  #2 idx=264 v=13.944234800
+  #3 idx=3750 v=13.658498800
+  #4 idx=198 v=13.114166300
+  #5 idx=279 v=13.002813300
+argmax=11751
