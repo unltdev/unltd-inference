@@ -29,8 +29,8 @@
 //! f64 secuencial (ggml_vec_dot_f32 scalar) y mad sin FMA. Queda documentado
 //! en docs/QWEN35-FORWARD.md §7: la fuente residual de diferencias ~1e-7 en
 //! las entradas produce "flips" de qs en la cuantización Q8_K de los gemvs
-//! aguas abajo (piso real ~1e-4 por flip, no 5e-5) — ver el mecanismo en
-//! benchmarks/reference/tmp-flips.py.
+//! aguas abajo (piso real ~1e-4 por flip, no 5e-5) — ver el mecanismo y la
+//! evidencia en docs\PHASE-6-CHECKPOINT.md.
 
 use unltd_architectures::qwen35::Qwen35Config;
 use unltd_core::LoadError;

@@ -27,6 +27,8 @@ import struct
 import sys
 from pathlib import Path
 
+import numpy as np
+
 N_LAYER = 32
 N_TOKENS = 5
 N_EMBD = 4096
@@ -124,7 +126,9 @@ def load_engine(path: Path):
             file=sys.stderr,
         )
         sys.exit(1)
-    return n_layer, n_tokens, n, b
+    # ¡Los datos empiezan DESPUÉS del header de 12 bytes! (bug 2026-08-18:
+    # leer desde off=0 corría todo 3 floats y las puertas fallaban todas).
+    return n_layer, n_tokens, n, b[12:]
 
 
 def main() -> int:
@@ -158,7 +162,9 @@ def main() -> int:
         return 1
 
     names = ("l_out", "attn_residual", "linear_attn_out")
-    stride = n_tokens * 3 * n
+    # stride en BYTES: unpack_from cuenta bytes y off se usa en bytes (bug
+    # 2026-08-18: off en floats × il leía basura para capas ≥ 1).
+    stride = n_tokens * 3 * n * 4
     failures = []
     n_pass = 0
     for il in range(n_layer):
@@ -169,11 +175,17 @@ def main() -> int:
             key = f"{name}-{il}"
             if key not in TARGETS:
                 continue  # linear_attn_out no existe en capas de atención
-            # suma sobre TODO el tensor (el volcado imprime una suma global)
-            tot = 0.0
+            # suma sobre TODO el tensor (el volcado imprime una suma global).
+            # El oráculo acumula `float sum = 0; sum += v;` en f32 SECUENCIAL
+            # (common/debug.cpp) sobre el tensor en orden row-major (i0 más
+            # rápido → tokens concatenados) — replicar ese orden y tipo
+            # EXACTOS: una suma f64 de Python produce ~0.1 de ruido fantasma
+            # en tensores con cancelación (mismo bug que tuvo compare-nodes).
+            acc = np.float32(0.0)
             for t in range(n_tokens):
                 mine = struct.unpack_from(f"<{n}f", eng, off + t * 3 * n * 4 + k * n * 4)
-                tot += sum(mine)
+                for x in mine:
+                    acc = np.float32(acc + np.float32(x))
                 ora_rows = found[key]["rows"]
                 pin = max(abs(mine[PINNED[p]] - ora_rows[t][p]) for p in range(6))
                 if args.detail == il:
@@ -184,6 +196,7 @@ def main() -> int:
                     )
                 if pin > worst_pin[0]:
                     worst_pin = (pin, f"{key}[token {t}][max pin]")
+            tot = float(acc)
             ds = abs(tot - found[key]["sum"])
             if args.detail == il:
                 print(f"  {key} total: sum_d={ds:.2e} (mine={tot:.4f} ora={found[key]['sum']:.4f})")
