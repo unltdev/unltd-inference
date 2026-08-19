@@ -398,7 +398,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unltd-architectures"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -409,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-generation"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "rayon",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-memory"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "memmap2",
  "rayon",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-model-loader"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "memmap2",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-tensor"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytemuck",
  "half",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "unltd-tokenizer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "regex",
  "thiserror",
