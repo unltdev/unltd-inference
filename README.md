@@ -2,7 +2,7 @@
 
 Disk-first, CPU-first LLM inference runtime written in Rust.
 
-Version: 1.0.0 · Language: Rust · Platform validated: Windows x86-64 · Execution: CPU-first · Model format: GGUF
+Version: 1.0.0 · Language: Rust · Platform validated: Windows x86-64 · Execution: CPU-first · Model format: GGUF · License: Apache-2.0
 
 > Developed by UNLTD as an experimental / research runtime. Correctness was prioritized over performance throughout the project; see [Current limitations](#20-current-limitations) for what this means in practice.
 
@@ -163,7 +163,7 @@ The model path is a **positional** argument in every command (there is no `--mod
 ## 9. Inspect a model
 
 ```powershell
-.\target\release\unltd.exe inspect "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf"
+.\target\release\unltd.exe inspect "path\to\ornith-1.0-9b-Q4_K_M.gguf"
 ```
 
 Prints: file size, GGUF version, metadata key/values, the tensor table (name, dims, type, offset, exact bytes, % of file), a summary of total tensor bytes and top tensors. `--no-tensors` skips the per-tensor table.
@@ -171,7 +171,7 @@ Prints: file size, GGUF version, metadata key/values, the tensor table (name, di
 ## 10. Tokenize
 
 ```powershell
-.\target\release\unltd.exe tokenize "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf" --text "The capital of France is"
+.\target\release\unltd.exe tokenize "path\to\ornith-1.0-9b-Q4_K_M.gguf" --text "The capital of France is"
 ```
 
 Prints the tokenizer kind and pre-tokenizer, vocab size, BOS/EOS, and the per-token table (id, piece, decoded bytes) plus the full decoded text. Tokenization is raw (no BOS), matching the validation mode.
@@ -180,7 +180,7 @@ Prints the tokenizer kind and pre-tokenizer, vocab size, BOS/EOS, and the per-to
 
 ```powershell
 .\target\release\unltd.exe run `
-  "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf" `
+  "path\to\ornith-1.0-9b-Q4_K_M.gguf" `
   --prompt "The capital of France is" `
   --max-tokens 3 `
   --temperature 0 `
@@ -353,12 +353,16 @@ performance instrumentation
 
 ## 23. License
 
-**License: not yet specified.** The repository does not currently contain a LICENSE file. (The workspace manifest carries `license = "Apache-2.0"` metadata pending a final decision by the project owner.)
+UNLTD Inference is open source, licensed under the **Apache License 2.0**. See [LICENSE](LICENSE) for the full license text.
+
+Portions of this project (tokenizer splitter logic and regex patterns, scalar quantized kernels, Qwen3.5 forward structure) are implemented from llama.cpp / ggml's MIT-licensed algorithms. Their MIT notice is retained in [NOTICE](NOTICE).
+
+Contributions are welcome under the terms of the Apache License 2.0.
 
 ## 24. Credits / References
 
-- [llama.cpp](https://github.com/ggml-org/llama.cpp) — used as the validation oracle, GGUF format reference, and benchmark; no affiliation
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) — used as the validation oracle, GGUF format reference, and benchmark; portions of the tokenizer and scalar kernels follow its MIT-licensed reference algorithms (see [NOTICE](NOTICE)); no affiliation
 - The GGUF ecosystem — model container format
 - [kimi-k3-in-c](https://github.com/MoonshotAI/kimi-k3-in-c) — conceptual inspiration for disk-first inference; not a fork, not a port, contains no K3 code; no affiliation
 
-*This project is not affiliated with any of the above projects.*
+*This project is not affiliated with llama.cpp, Moonshot AI, Kimi, or any of the above projects.*

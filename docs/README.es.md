@@ -29,11 +29,11 @@ El límite de memoria es una **característica explícita** del runtime: los pes
 ```powershell
 cargo build --release -p unltd-cli
 
-.\target\release\unltd.exe inspect  "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf"
-.\target\release\unltd.exe tokenize "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf" --text "The capital of France is"
+.\target\release\unltd.exe inspect  "path\to\ornith-1.0-9b-Q4_K_M.gguf"
+.\target\release\unltd.exe tokenize "path\to\ornith-1.0-9b-Q4_K_M.gguf" --text "The capital of France is"
 
 .\target\release\unltd.exe run `
-  "D:\AI\models\Ornith-1.0-9B-GGUF\ornith-1.0-9b-Q4_K_M.gguf" `
+  "path\to\ornith-1.0-9b-Q4_K_M.gguf" `
   --prompt "The capital of France is" `
   --max-tokens 3 `
   --temperature 0 `
@@ -67,6 +67,6 @@ CPU-only (scalar, ~14 s/token de decode vs ~230 ms de llama.cpp), sin sampling, 
 
 ## Licencia
 
-**No especificada todavía**: el repositorio no tiene archivo LICENSE (el manifest lleva metadata `license = "Apache-2.0"` a la espera de la decisión final del dueño del proyecto).
+UNLTD Inference es código abierto, bajo la **Apache License 2.0**. Ver [LICENSE](../LICENSE) para el texto completo. Partes del proyecto (tokenizador, kernels escalares cuantizados, estructura forward Qwen3.5) están implementadas a partir de los algoritmos MIT de llama.cpp/ggml; su aviso MIT se conserva en [NOTICE](../NOTICE). No está afiliado a llama.cpp, Moonshot AI ni Kimi.
 
 Documentación completa: `README.md` y `docs/` (AUDIT, ARCHITECTURE, MEMORY-DESIGN, checkpoints por fase, etc.).

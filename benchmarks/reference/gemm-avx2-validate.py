@@ -30,14 +30,15 @@ import numpy as np
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------- reutilizar diag
+# Dev helper paths (local to the validation machine; edit before use):
 _D = importlib.util.spec_from_file_location(
-    "diag", r"C:\Users\gpsan\.claude\jobs\b4d2a9ae\tmp\diag-ffn8322.py")
+    "diag", r"<dev-helper-path>\diag-ffn8322.py")
 diag = importlib.util.module_from_spec(_D)
 _D.loader.exec_module(diag)
 
 MODEL = diag.MODEL
 DUMP = diag.DUMP
-CACHE = r"C:\Users\gpsan\.claude\jobs\b4d2a9ae\tmp\gemm-dump-cache.npz"
+CACHE = r"<dev-cache-path>\gemm-dump-cache.npz"
 f32 = diag.f32
 f32bits = diag.f32bits
 f16 = diag.f16
