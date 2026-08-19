@@ -636,11 +636,11 @@ Contributions are welcome under the terms of the Apache License 2.0.
 * The **GGUF ecosystem**
   Model container format and surrounding tooling ecosystem.
 
-* [kimi-k3-in-c](https://github.com/MoonshotAI/kimi-k3-in-c)
+* [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c)
   Conceptual inspiration for disk-first inference research.
   **UNLTD Inference is not a fork, not a port, and contains no K3 code.**
 
-> This project is **not affiliated** with llama.cpp, ggml, Moonshot AI, Kimi, or any of the above projects.
+> This project is **not affiliated** with llama.cpp, ggml, Kimi, or the kimi-k3-in-c project.
 
 ---
 

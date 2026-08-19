@@ -67,6 +67,6 @@ CPU-only (scalar, ~14 s/token de decode vs ~230 ms de llama.cpp), sin sampling, 
 
 ## Licencia
 
-UNLTD Inference es código abierto, bajo la **Apache License 2.0**. Ver [LICENSE](../LICENSE) para el texto completo. Partes del proyecto (tokenizador, kernels escalares cuantizados, estructura forward Qwen3.5) están implementadas a partir de los algoritmos MIT de llama.cpp/ggml; su aviso MIT se conserva en [NOTICE](../NOTICE). No está afiliado a llama.cpp, Moonshot AI ni Kimi.
+UNLTD Inference es código abierto, bajo la **Apache License 2.0**. Ver [LICENSE](../LICENSE) para el texto completo. Partes del proyecto (tokenizador, kernels escalares cuantizados, estructura forward Qwen3.5) están implementadas a partir de los algoritmos MIT de llama.cpp/ggml; su aviso MIT se conserva en [NOTICE](../NOTICE). No está afiliado a llama.cpp, Kimi ni al proyecto kimi-k3-in-c.
 
 Documentación completa: `README.md` y `docs/` (AUDIT, ARCHITECTURE, MEMORY-DESIGN, checkpoints por fase, etc.).

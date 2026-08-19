@@ -1,0 +1,84 @@
+name: Bug report
+description: Report a bug in UNLTD Inference
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: UNLTD Inference version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "Windows 11 Pro 10.0.26200"
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: "e.g. AMD Ryzen 7 5800X"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command executed
+      description: The exact command line, with the model path replaced by a placeholder if sensitive.
+      render: powershell
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model / architecture
+      placeholder: "e.g. Ornith 1.0 9B (Qwen3.5-compatible)"
+    validations:
+      required: false
+  - type: input
+    id: quant
+    attributes:
+      label: Quantization
+      placeholder: "e.g. Q4_K_M"
+    validations:
+      required: false
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Minimal logs
+      description: Only the relevant output — no model dumps, no huge logs.
+      render: text
+    validations:
+      required: false
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. ...\n2. ..."
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmations
+      options:
+        - label: I confirm this report contains no secrets, credentials, or GGUF files.
+          required: true
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
