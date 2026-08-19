@@ -17,6 +17,7 @@
 </p>
 
 <p>
+  <a href="https://github.com/unltdev/unltd-inference/actions/workflows/ci.yml"><img src="https://github.com/unltdev/unltd-inference/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/github/stars/unltdev/unltd-inference?style=flat-square&color=1D4ED8" alt="stars" />
   <img src="https://img.shields.io/github/forks/unltdev/unltd-inference?style=flat-square&color=06B6D4" alt="forks" />
   <img src="https://img.shields.io/github/issues/unltdev/unltd-inference?style=flat-square&color=0B1220" alt="issues" />
