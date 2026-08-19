@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+
+  pull_request:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust 1.80
+        run: rustup toolchain install 1.80 --profile minimal --component rustfmt
+
+      - name: Use Rust 1.80
+        run: rustup default 1.80
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          rustfmt --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Check workspace
+        run: cargo check --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Build release CLI
+        run: cargo build --release -p unltd-cli --locked
